@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poe-bulk-export"
+version = "0.1.0"
+description = "Export all Poe.com chats to Archive Markdown (and optional JSON)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Poe Bulk Export" }]
+dependencies = [
+  "playwright>=1.40",
+  "httpx>=0.27",
+  "tqdm>=4.66",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+poe-bulk-export = "poe_bulk_export.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["poe_bulk_export*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

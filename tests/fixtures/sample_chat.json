@@ -1,0 +1,47 @@
+{
+  "chatId": 12345,
+  "chatCode": "abc123",
+  "id": "Q2hhdDoxMjM0NQ==",
+  "title": "Sample Poe Chat",
+  "bot": "Claude-Sonnet-4.5",
+  "messages": [
+    {
+      "author": "human",
+      "text": "Hello — please summarize this.",
+      "messageId": 1001,
+      "contentType": "text/plain",
+      "time_epoch_us": 1705312200000000,
+      "attachments": []
+    },
+    {
+      "author": "claude_sonnet_4_5",
+      "text": "Sure. Here is a short summary.",
+      "messageId": 1002,
+      "contentType": "text/markdown",
+      "time_epoch_us": 1705312205000000,
+      "attachments": [
+        {
+          "url": "https://qph.cf2.poecdn.net/example.png",
+          "name": "example.png",
+          "kind": "image",
+          "local_path": null
+        }
+      ]
+    },
+    {
+      "author": "human",
+      "text": "Thanks! ![sketch](https://qph.cf2.poecdn.net/sketch.jpg)",
+      "messageId": 1003,
+      "contentType": "text/markdown",
+      "time_epoch_us": 1705312210000000,
+      "attachments": [
+        {
+          "url": "https://qph.cf2.poecdn.net/sketch.jpg",
+          "name": "sketch",
+          "kind": "image",
+          "local_path": "attachments/abc123/msg-1003-0-sketch.jpg"
+        }
+      ]
+    }
+  ]
+}
