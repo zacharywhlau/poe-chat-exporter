@@ -1,5 +1,8 @@
-# Exports and secrets
+# Exports, debug dumps and secrets
 poe_exports/
+poe_debug/
+check/
+poe-chat-export-*.md
 .env
 *.cookie
 cookies.txt

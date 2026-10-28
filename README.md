@@ -1,129 +1,231 @@
-# Poe bulk Markdown exporter
+# Poe chat exporter (`poe-bulk-export`)
 
-Export **all** of your [Poe.com](https://poe.com) conversations to **Archive Markdown** (and optional JSON) from the command line.
+Export your [Poe.com](https://poe.com) conversations to Markdown (and optionally JSON) from the command line: every chat in one run, or specific chats by code.
 
-This is meant for bulk backup. Per-chat tagging with [`@export-chat`](https://poe.com/export-chat) is still fine for one-off transcripts; it cannot walk your full history automatically. Poe’s official API also does not expose chat-history export.
-
-## Archive Markdown (default)
-
-Each chat becomes one `.md` file with YAML frontmatter, ISO-8601 timestamps, clear speaker headings, and attachment links. With `--download-attachments`, media is saved under `attachments/<chat_code>/` and links are rewritten to relative paths so the archive stays usable if CDN URLs expire.
-
-```markdown
----
-title: "Conversation title"
-bot: "Claude-Sonnet-4.5"
-chat_id: 12345
-chat_code: "abc123"
-exported_at: 2026-10-28T06:25:00+00:00
-message_count: 2
----
-
-# Conversation title
-
-## You · 2026-01-15T10:30:00+00:00
-
-User message…
-
-## Claude-Sonnet-4.5 · 2026-01-15T10:30:05+00:00
-
-Bot reply…
-```
+The exporter reads the raw message data Poe ships with each chat page: the same Markdown that [`@export-chat`](https://poe.com/export-chat) prints. Code blocks, headings and lists come through exactly as the bot wrote them, and `--style export-chat` produces a file byte-for-byte identical to `@export-chat`'s.
 
 ## Requirements
 
 - Python 3.10+
-- A logged-in Poe account (session cookie)
-- Chromium for Playwright (handles Cloudflare)
+- A signed-in Poe account (its `p-b` session cookie)
+- Chromium for Playwright (Poe sits behind Cloudflare, so a real browser does the requests)
 
 ## Install
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 playwright install chromium
 ```
 
-## Get your Poe session cookie
+After `git pull`, run `pip install -e .` again so new dependencies and CLI options are picked up.
+
+## Sign-in cookie
 
 1. Open [poe.com](https://poe.com) and sign in.
 2. Open DevTools → **Application** → **Cookies** → `https://poe.com`.
-3. Copy the **`p-b`** value.
-4. Optionally copy **`p-lat`** if auth fails with `p-b` alone.
+3. Copy the **`p-b`** value. If exports fail with `p-b` alone, also copy **`p-lat`**.
 
-Put them in the environment (preferred) or pass CLI flags:
+The CLI reads `POE_TOKEN` / `POE_LAT` from the environment, or `--token` / `--lat`:
 
 ```bash
-cp .env.example .env
-# edit .env — or:
 export POE_TOKEN='your_p-b_value'
-export POE_LAT='optional_p-lat_value'   # if needed
+export POE_LAT='your_p-lat_value'      # optional
+
+# or keep them in .env (git-ignored) and load it into the shell:
+cp .env.example .env                   # then edit .env
+set -a; source .env; set +a
 ```
 
-Never commit real cookie values.
+On Windows PowerShell: `$env:POE_TOKEN = 'your_p-b_value'`.
+
+Never commit real cookie values. When the cookie expires, the CLI stops with exit code 2 instead of writing empty exports.
 
 ## Usage
 
 ```bash
-# List chats
+# List your chats (bot, title, chat code)
 poe-bulk-export list
 
-# Export all chats as Archive Markdown (default)
+# Export every chat into ./poe_exports
 poe-bulk-export export
 
-# JSON, or both; custom output dir; first N chats
-poe-bulk-export export -f json -o my_chats
-poe-bulk-export export -f both -l 10
+# Export specific chats, opened directly (a chat code or a chat URL; repeatable)
+poe-bulk-export export --chat-code abc123xyz
+poe-bulk-export export -c https://poe.com/chat/abc123xyz -c def456uvw
 
-# Single chat (code from `poe-bulk-export list`, or the __code suffix in a filename)
-poe-bulk-export export --chat-code 91z1xrschrxyu24wqx
-# After git pull, reinstall so the CLI picks up new flags:
-#   pip install -e .
-
-# Markdown closer to @export-chat (User: / Bot: turns); strip thinking (default)
+# Same layout as Poe's @export-chat
 poe-bulk-export export --style export-chat
-poe-bulk-export export --include-thinking   # keep reasoning blocks
 
-# Optional: save real images offline (skips HTML error pages). Default keeps
-# CDN URLs embedded in the Markdown, like the chat UI.
-poe-bulk-export export --download-attachments
+# Markdown and JSON, keep "Thinking..." blocks, save images/files locally
+poe-bulk-export export -f both --include-thinking --download-attachments
 
-# Pass token explicitly
-poe-bulk-export export -t 'your_p-b_value'
+# Later runs: only re-export chats that changed since their last complete export
+poe-bulk-export export --incremental
 ```
 
-Chat pages use `https://poe.com/chat/{code}` (not `/c/`, which often 404s). Turn order follows the on-page DOM; network JSON upgrades markdown (code fences). Bare language tags from DOM text (e.g. `bash` instead of ` ```bash `) are repaired. Speakers are labeled You/User vs bot, and thinking is stripped unless `--include-thinking` is set.
+| Option | Meaning |
+| --- | --- |
+| `-c, --chat-code` | Export only these chats (code or URL, repeatable). Skips the chat-list scan. |
+| `-f, --format` | `markdown` (default), `json` or `both`. |
+| `--style` | `archive` (default) or `export-chat`. See [Output](#output). |
+| `--include-thinking` | Keep the leading `*Thinking...*` reasoning block some bots add (stripped by default). |
+| `-o, --output` | Output directory (default `poe_exports`). |
+| `--incremental` | Skip chats that are unchanged and were exported completely before. |
+| `--download-attachments` | Save real media under `attachments/<chat_code>/` and link the local copies. |
+| `-l, --limit` | Export at most N chats from the list. |
+| `--max-pages` | Upper bound on pages of older messages loaded per chat (default 200). |
+| `-v, --verbose` | Show how each chat was harvested. |
+| `--headed` | Show the browser window. |
 
-Images/files stay as inline Markdown (`![…](https://…poecdn…)`) by default — same idea as viewing the chat. Separate attachment files are optional and only kept when the download is real media (not an HTML error page).
+Each chat gets one status line, and the run ends with a summary:
 
-Files are named `{model}_{title}__{chatCode}.md`, with a leading `{YYYY-MM-DD}_` only when a chat date is known:
+```text
+OK   Trip planning [abc123xyz]: 42 messages (store=42, next_data=2), complete (4.2s) -> 2026-01-15_Claude-Sonnet-4.5_Trip_planning__abc123xyz.md
+Done: exported 1/1 -> poe_exports/
+```
 
-`Claude-Fable-5_Python_Learning_Project__93ozu1d1q42v5qtcou.md`  
-`2024-07-09_Claude-Fable-5_Python_Learning_Project__93ozu1d1q42v5qtcou.md`
+`WARN` means the export was written, but either the chat's full history could not be confirmed as loaded, or the page had no raw data and the rendered HTML was used instead. `FAIL` means nothing could be read for that chat. Warnings and failures are listed again at the end.
 
+## Output
+
+### Styles
+
+**`export-chat`**: identical to Poe's `@export-chat`. Each turn is `User:` or `<Bot name>:`, a blank line, then the message's raw Markdown. Turns are separated by `---`. There is no header and no trailing newline, matching Poe's file.
+
+```markdown
+User:
+
+Plan a three-day trip to Kyoto.
+
+---
+
+Claude-Sonnet-4.5:
+
+## Day 1
+…
+```
+
+**`archive`** (default): YAML front matter, then the same transcript. Before each turn, an HTML comment records the message time and id; it does not show up when the Markdown is rendered.
+
+```markdown
+---
+title: "Trip planning"
+bot: "Claude-Sonnet-4.5"
+chat_code: "abc123xyz"
+chat_id: 123456789
+url: "https://poe.com/chat/abc123xyz"
+created: "2026-01-15T10:30:00Z"
+updated: "2026-01-15T10:31:12Z"
+message_count: 2
+complete: true
+source: "raw"
+exported_at: "2026-10-28T09:30:00Z"
+exporter: "poe-bulk-export 0.2.0"
+---
+
+<!-- 2026-01-15T10:30:00Z · message 1001 -->
+User:
+
+Plan a three-day trip to Kyoto.
+
+---
+
+<!-- 2026-01-15T10:31:12Z · message 1002 -->
+Claude-Sonnet-4.5:
+
+## Day 1
+…
+```
+
+`complete: false` means older messages could not all be loaded, and `complete: null` means Poe gave no paging information to check against. `source: "dom-fallback"` means the page carried no raw message data and the text was converted from the rendered HTML, so formatting may differ from the original.
+
+**JSON** (`-f json` or `both`) holds the same chat metadata plus one object per message: `messageId`, `role`, `author`, `authorName`, `text`, `contentType`, `state`, `time`, `time_epoch_us` and `attachments`.
+
+### Files
+
+- Names are `{date}_{bot}_{title}__{chatCode}.md` (and `.json`). The date is the first message's day and is left out when unknown.
+- Re-exporting a chat replaces its file, including when the chat was renamed, so each chat has exactly one file per format.
+- Images and files already in a message's Markdown stay as Poe's CDN links. Attachments not mentioned in the text are appended as links. `--download-attachments` saves real media only (never HTML error pages) and points the links at the local copies.
+- `.poe-export-index.json` in the output directory records what was exported, for `--incremental`.
+
+**Upgrading from 0.1:** older versions saved repeated exports as extra copies ending in `-2`, `-3`, … (for example `…__abc123xyz-5.md`). Version 0.2 never creates them and leaves existing ones alone; delete them by hand after re-exporting.
+
+### Checking an export against `@export-chat`
+
+```bash
+poe-bulk-export export --chat-code abc123xyz --style export-chat -o check
+diff check/*__abc123xyz.md poe-chat-export-<timestamp>.md
+```
+
+`diff` prints nothing when the two files are identical.
 
 ## How it works
 
-1. Launches headless Chromium with your `p-b` cookie.
-2. Captures Poe GraphQL headers (`poe-formkey`, etc.).
-3. Paginates `ChatHistoryListPaginationQuery` for every conversation.
-4. Paginates `ChatListPaginationQuery` for every message (oldest → newest).
-5. Writes Archive Markdown and/or JSON.
+1. Chromium starts with your cookies and loads poe.com once to confirm you are signed in.
+2. Without `--chat-code`, the chat list is paged through Poe's `ChatHistoryListPaginationQuery`. With `--chat-code`, that scan is skipped and the title and bot come from the chat page itself.
+3. Each chat opens at `https://poe.com/chat/<code>`, and its messages are read from three places on the page:
+   - the Relay store (the web app's in-memory GraphQL cache),
+   - `window.__NEXT_DATA__` (the server-rendered page data),
+   - GraphQL responses captured while the page loads, including multipart `@defer`/`@stream` responses.
 
-GraphQL persisted-query hashes live in [`poe_bulk_export/gql_hashes.py`](poe_bulk_export/gql_hashes.py). If Poe redeploys and you see `PersistedQueryNotFound`, update that file.
+   Only messages on this chat's own message connection are taken, so previews of other chats in the sidebar cannot leak in.
+4. While the connection reports older messages (`hasPreviousPage`), the message list is scrolled to the top so Poe loads them itself. If scrolling stalls, older pages are requested directly with a signed `ChatListPaginationQuery`. A chat whose history still is not complete is exported with `complete: false` and a warning.
+5. Messages from all sources are merged by message id and ordered by creation time. Text is not edited, except for removing a leading `*Thinking...*` header plus its `>` quote block when an answer follows (unless `--include-thinking` is set).
+6. Only when a page has no raw message data at all is the rendered HTML converted to Markdown (with `markdownify`). Those exports are marked `source: "dom-fallback"` and reported as warnings.
+
+GraphQL persisted-query hashes live in [`poe_bulk_export/gql_hashes.py`](poe_bulk_export/gql_hashes.py); hashes seen in live traffic take precedence.
+
+## Troubleshooting
+
+If a chat is reported as `WARN` or `FAIL`, or its export looks wrong, capture what the page contained:
+
+```bash
+poe-bulk-export dump --chat-code abc123xyz
+```
+
+This writes `poe_debug/abc123xyz/`:
+
+| File | Contents |
+| --- | --- |
+| `summary.json` | Message counts per source, completeness, notes, the scroll log |
+| `messages.json` | The merged raw messages |
+| `export-chat.md` | What `--style export-chat` would write |
+| `next_data.json` | The page's `__NEXT_DATA__` |
+| `store_records.json`, `store_summary.json` | The chat's records from the Relay store |
+| `network/NNN-<Query>.json` | Captured GraphQL responses |
+| `dom.html` | The rendered message list |
+
+Cookies and request headers are never written, and account fields such as email, phone, uid and formkey are replaced with `[redacted]`. The dump still contains the chat itself (and `dom.html` may include sidebar chat titles), so review it before sharing.
+
+Other things to try:
+
+- Exit code 2 or "not logged in": copy a fresh `p-b` (and `p-lat`) cookie.
+- `--headed --verbose` to watch the browser and see each harvesting step.
+- `PersistedQueryNotFound`: Poe redeployed; update `gql_hashes.py`.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Every chat was exported (warnings may be listed) |
+| 1 | At least one chat failed, or no cookie was given |
+| 2 | Poe redirected to the login page (cookie missing or expired), or the command-line options were invalid |
 
 ## Caveats
 
-- Uses Poe’s **unofficial** web GraphQL API; it can break without notice.
-- Session cookies expire; grab a fresh `p-b` when auth fails.
-- Prefer `--download-attachments` for a durable media archive.
+- This uses Poe's unofficial web app data and GraphQL API, which can change without notice. `dump` shows what a page contains when that happens.
+- Session cookies expire; grab a fresh `p-b` when sign-in fails.
+- Poe's CDN links can expire; use `--download-attachments` for a durable media archive.
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest
-poe-bulk-export --help
+pytest                                       # offline tests, including the golden @export-chat comparison
+POE_LIVE=1 pytest tests/test_live_share.py   # also harvest a public Poe share page in Chromium
+ruff check .
 ```
 
-Inspired by community exporters such as [ericblue/poe-chat-exporter](https://github.com/ericblue/poe-chat-exporter); this project uses its own package layout, Archive Markdown format, and optional attachment download.
+The golden test renders recorded store records for a real four-turn chat and compares the result byte-for-byte with that chat's `@export-chat` file (`tests/fixtures/workflow_guide_export_chat.md`). The other fixtures are trimmed page data from a public share page.
+
+Inspired by community exporters such as [ericblue/poe-chat-exporter](https://github.com/ericblue/poe-chat-exporter).
