@@ -152,10 +152,11 @@ def _chat_urls(chat: Chat) -> list[str]:
     code = chat.chat_code
     handle = (chat.bot_handle or "").strip().lstrip("@")
     if code:
+        # Prefer /chat/ — /c/ often 404s on current Poe.
         urls.extend(
             [
-                f"https://poe.com/c/{code}",
                 f"https://poe.com/chat/{code}",
+                f"https://poe.com/c/{code}",
             ]
         )
         if handle:
@@ -173,6 +174,91 @@ def _chat_urls(chat: Chat) -> list[str]:
             seen.add(url)
             out.append(url)
     return out
+
+
+_UI_CHROME = {
+    "thinking",
+    "thinking...",
+    "*thinking...*",
+    "view all",
+    "run",
+    "copy",
+    "edited",
+    "regenerate",
+}
+
+
+def _looks_like_ui_chrome(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    if t in _UI_CHROME:
+        return True
+    # Truncated virtualized code panes from the Poe UI
+    if t.startswith("python\nview all") or t.startswith("python\nView all".lower()):
+        return True
+    if "\nview all\n" in f"\n{t}\n" and len(t) < 800 and "```" not in t:
+        return True
+    return False
+
+
+def _normalize_for_dedupe(text: str) -> str:
+    return " ".join((text or "").split()).lower()
+
+
+def _prefer_message(a: Message, b: Message) -> Message:
+    """Prefer the richer copy when two messages are near-duplicates."""
+    a_code = (a.text or "").count("```")
+    b_code = (b.text or "").count("```")
+    if a_code != b_code:
+        return a if a_code > b_code else b
+    if abs(len(a.text or "") - len(b.text or "")) > 40:
+        return a if len(a.text or "") >= len(b.text or "") else b
+    # Prefer labeled human/bot over unknown; prefer timestamped
+    a_score = (0 if a.author == "unknown" else 1) + (1 if a.creation_time_us else 0)
+    b_score = (0 if b.author == "unknown" else 1) + (1 if b.creation_time_us else 0)
+    if a_score != b_score:
+        return a if a_score > b_score else b
+    return a if len(a.text or "") >= len(b.text or "") else b
+
+
+def _dedupe_messages(messages: list[Message]) -> list[Message]:
+    """Drop UI chrome and keep the best copy of overlapping turns."""
+    cleaned = [m for m in messages if not _looks_like_ui_chrome(m.text)]
+    kept: list[Message] = []
+    for msg in cleaned:
+        norm = _normalize_for_dedupe(msg.text)
+        if not norm:
+            continue
+        replaced = False
+        for i, prev in enumerate(kept):
+            prev_norm = _normalize_for_dedupe(prev.text)
+            # Same id
+            if (
+                msg.message_id is not None
+                and prev.message_id is not None
+                and msg.message_id == prev.message_id
+            ):
+                kept[i] = _prefer_message(prev, msg)
+                replaced = True
+                break
+            # One contains the other (truncated DOM vs full answer)
+            if norm in prev_norm or prev_norm in norm:
+                if abs(len(norm) - len(prev_norm)) < max(80, int(0.2 * max(len(norm), len(prev_norm)))):
+                    # nearly identical
+                    kept[i] = _prefer_message(prev, msg)
+                    replaced = True
+                    break
+                if len(norm) > len(prev_norm) and prev_norm in norm:
+                    kept[i] = _prefer_message(prev, msg)
+                    replaced = True
+                    break
+                if len(prev_norm) > len(norm) and norm in prev_norm:
+                    replaced = True
+                    break
+        if not replaced:
+            kept.append(msg)
+    return kept
 
 
 class PoeClient:
@@ -432,9 +518,15 @@ class PoeClient:
             """() => {
               const messages = [];
               const seen = new Set();
+              const chrome = new Set([
+                'thinking', 'thinking...', 'view all', 'run', 'copy', 'edited', 'regenerate'
+              ]);
               const push = (author, text) => {
                 const t = (text || '').trim();
                 if (!t) return;
+                if (chrome.has(t.toLowerCase())) return;
+                // Skip tiny UI fragments
+                if (t.length < 3) return;
                 const key = author + '\\n' + t;
                 if (seen.has(key)) return;
                 seen.add(key);
@@ -605,11 +697,9 @@ class PoeClient:
         finally:
             self.page.remove_listener("response", on_response)
 
-        # DOM order is usually oldest→newest already; network msgs may need sort
-        messages = list(by_key.values())
+        messages = _dedupe_messages(list(by_key.values()))
         if any(m.creation_time_us for m in messages):
             return _sort_messages(messages)
-        # Preserve scrape order: human/bot turns as collected
         return messages
 
 
