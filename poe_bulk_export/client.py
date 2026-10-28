@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import time
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 from playwright.sync_api import Playwright, sync_playwright
 
 from poe_bulk_export.attachments import is_skip_attachment_url
-from poe_bulk_export.cleanup import cleanup_messages
+from poe_bulk_export.cleanup import cleanup_messages, normalize_author
 from poe_bulk_export.gql_hashes import QUERIES
 from poe_bulk_export.models import Attachment, Chat, Message
 from poe_bulk_export.util import (
@@ -229,8 +230,64 @@ def _looks_like_ui_chrome(text: str) -> bool:
     return False
 
 
+_BARE_LANG_LINE = re.compile(
+    r"(?mi)^\s*(?:bash|sh|shell|zsh|python|py|yaml|yml|json|javascript|js|"
+    r"typescript|ts|html|css|sql|toml|ini|gitignore|dockerfile|docker|"
+    r"console|text|plaintext|markdown|md|xml|rust|go|ruby|java|c|cpp|"
+    r"csharp|swift|kotlin|r|php|diff|makefile)\s*$"
+)
+
+
 def _normalize_for_dedupe(text: str) -> str:
-    return " ".join((text or "").split()).lower()
+    """Fingerprint that ignores markdown fences so DOM/network copies match."""
+    t = text or ""
+    t = re.sub(r"```[\w+-]*\n?", "\n", t)
+    t = _BARE_LANG_LINE.sub("\n", t)
+    t = re.sub(r"[*_`#>]+", " ", t)
+    return " ".join(t.split()).lower()
+
+
+def _speaker_side(author: str) -> str:
+    a = normalize_author(author or "")
+    if a == "human":
+        return "human"
+    if a in ("unknown", ""):
+        return "unknown"
+    return "bot"
+
+
+def _same_speaker(a: str, b: str) -> bool:
+    sa, sb = _speaker_side(a), _speaker_side(b)
+    if sa == "unknown" or sb == "unknown":
+        return True
+    return sa == sb
+
+
+def _overlap_score(a: str, b: str) -> float:
+    fa, fb = _normalize_for_dedupe(a), _normalize_for_dedupe(b)
+    if not fa or not fb:
+        return 0.0
+    if fa == fb:
+        return 1.0
+    shorter, longer = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+    if shorter in longer:
+        return len(shorter) / max(len(longer), 1)
+    # Shared prefix — network markdown vs DOM plain text often diverge mid-body
+    # after a long identical lead-in.
+    i = 0
+    limit = min(len(fa), len(fb))
+    while i < limit and fa[i] == fb[i]:
+        i += 1
+    prefix_ratio = i / max(len(fa), len(fb), 1)
+    if i >= 60 and prefix_ratio >= 0.35:
+        return max(0.6, prefix_ratio)
+    if i >= 100:
+        return 0.7
+    # Significant shared lead token window
+    n = min(120, len(fa), len(fb))
+    if n >= 40 and fa[:n] == fb[:n]:
+        return 0.8
+    return 0.0
 
 
 def _merge_metadata(winner: Message, other: Message) -> Message:
@@ -260,6 +317,13 @@ def _prefer_message(a: Message, b: Message) -> Message:
     """Prefer network JSON over DOM, then richer / better-labeled copies."""
     a_net = 1 if a.source == "network" else 0
     b_net = 1 if b.source == "network" else 0
+    a_fences = (a.text or "").count("```")
+    b_fences = (b.text or "").count("```")
+    # Strong preference: real markdown fences beat bare language tags
+    if a_fences != b_fences:
+        winner, loser = (a, b) if a_fences > b_fences else (b, a)
+        if len(winner.text or "") + 120 >= len(loser.text or ""):
+            return _merge_metadata(winner, loser)
     if a_net != b_net:
         # Network text wins unless it's dramatically shorter/truncated
         winner, loser = (a, b) if a_net else (b, a)
@@ -267,10 +331,6 @@ def _prefer_message(a: Message, b: Message) -> Message:
             return _merge_metadata(winner, loser)
         # DOM was much longer — keep DOM text but preserve network metadata
         return _merge_metadata(loser, winner)
-    a_code = (a.text or "").count("```")
-    b_code = (b.text or "").count("```")
-    if a_code != b_code:
-        return _merge_metadata(*( (a, b) if a_code > b_code else (b, a) ))
     if abs(len(a.text or "") - len(b.text or "")) > 40:
         return _merge_metadata(
             *((a, b) if len(a.text or "") >= len(b.text or "") else (b, a))
@@ -294,6 +354,8 @@ def _dedupe_messages(messages: list[Message]) -> list[Message]:
             continue
         replaced = False
         for i, prev in enumerate(kept):
+            if not _same_speaker(prev.author, msg.author):
+                continue
             prev_norm = _normalize_for_dedupe(prev.text)
             # Same id
             if (
@@ -304,10 +366,16 @@ def _dedupe_messages(messages: list[Message]) -> list[Message]:
                 kept[i] = _prefer_message(prev, msg)
                 replaced = True
                 break
+            score = _overlap_score(msg.text, prev.text)
+            if score >= 0.55:
+                kept[i] = _prefer_message(prev, msg)
+                replaced = True
+                break
             # One contains the other (truncated DOM vs full answer)
             if norm in prev_norm or prev_norm in norm:
-                if abs(len(norm) - len(prev_norm)) < max(80, int(0.2 * max(len(norm), len(prev_norm)))):
-                    # nearly identical
+                if abs(len(norm) - len(prev_norm)) < max(
+                    80, int(0.2 * max(len(norm), len(prev_norm)))
+                ):
                     kept[i] = _prefer_message(prev, msg)
                     replaced = True
                     break
@@ -321,6 +389,55 @@ def _dedupe_messages(messages: list[Message]) -> list[Message]:
         if not replaced:
             kept.append(msg)
     return kept
+
+
+def _assemble_from_dom_and_network(
+    dom_msgs: list[Message],
+    network_msgs: list[Message],
+) -> list[Message]:
+    """DOM document order drives turns; network upgrades text/metadata."""
+    if not dom_msgs:
+        messages = list(network_msgs)
+        if any(m.creation_time_us for m in messages):
+            return _sort_messages(messages)
+        return messages
+
+    unused = list(network_msgs)
+    result: list[Message] = []
+
+    for dom in dom_msgs:
+        if _looks_like_ui_chrome(dom.text):
+            continue
+        best_i = -1
+        best_score = 0.0
+        for i, net in enumerate(unused):
+            if not _same_speaker(dom.author, net.author):
+                continue
+            score = _overlap_score(dom.text, net.text)
+            if score > best_score:
+                best_score = score
+                best_i = i
+        if best_i >= 0 and best_score >= 0.55:
+            net = unused.pop(best_i)
+            result.append(_prefer_message(net, dom))
+        else:
+            result.append(dom)
+
+    leftovers = unused
+    if any(m.creation_time_us for m in leftovers):
+        leftovers = _sort_messages(list(leftovers))
+    for net in leftovers:
+        if _looks_like_ui_chrome(net.text):
+            continue
+        if any(
+            _same_speaker(net.author, r.author)
+            and _overlap_score(net.text, r.text) >= 0.55
+            for r in result
+        ):
+            continue
+        result.append(net)
+
+    return result
 
 
 class PoeClient:
@@ -679,8 +796,9 @@ class PoeClient:
         scroll_pages: int = 25,
         include_thinking: bool = False,
     ) -> list[Message]:
-        """Open the chat page; prefer network JSON, fill gaps from the DOM."""
-        by_key: dict[Any, Message] = {}
+        """Open the chat page; DOM order drives turns, network upgrades text."""
+        network_by_key: dict[Any, Message] = {}
+        dom_ordered: list[Message] = []
         api_hits = 0
         network_count = 0
 
@@ -698,7 +816,7 @@ class PoeClient:
                 return
             for node in _walk_message_nodes(data):
                 network_count += 1
-                self._merge_message(by_key, _message_from_node(node))
+                self._merge_message(network_by_key, _message_from_node(node))
 
         self.page.on("response", on_response)
         page_info: dict[str, Any] = {}
@@ -721,12 +839,12 @@ class PoeClient:
                 print(f"  landed on {self.page.url}", file=sys.stderr)
                 opened = True
 
-                # If network already gave full messages, still scrape DOM once
-                # to fill speaker gaps, but network copies win on merge.
+                # DOM document order is the turn sequence; network upgrades
+                # markdown quality (fences) later in assemble.
                 dom_msgs, page_info = self._scrape_dom_messages()
-                for msg in dom_msgs:
-                    self._merge_message(by_key, msg)
-                if by_key:
+                if dom_msgs:
+                    dom_ordered = dom_msgs
+                if network_by_key or dom_ordered:
                     break
                 if api_hits > 0:
                     break
@@ -736,29 +854,39 @@ class PoeClient:
                 return []
 
             for i in range(scroll_pages):
-                before = len(by_key)
-                before_net = network_count
+                before_net = len(network_by_key)
+                before_dom = len(dom_ordered)
+                before_nodes = network_count
                 self._scroll_chat_up()
                 self.page.wait_for_timeout(1200)
                 dom_msgs, page_info = self._scrape_dom_messages()
-                for msg in dom_msgs:
-                    self._merge_message(by_key, msg)
-                if len(by_key) == before and network_count == before_net:
+                # Prefer the scrape with the most bubbles (older history loaded)
+                if len(dom_msgs) >= len(dom_ordered):
+                    dom_ordered = dom_msgs
+                if (
+                    len(network_by_key) == before_net
+                    and len(dom_ordered) == before_dom
+                    and network_count == before_nodes
+                ):
                     self.page.wait_for_timeout(1500)
                     dom_msgs, page_info = self._scrape_dom_messages()
-                    for msg in dom_msgs:
-                        self._merge_message(by_key, msg)
-                    if len(by_key) == before and i > 2:
+                    if len(dom_msgs) >= len(dom_ordered):
+                        dom_ordered = dom_msgs
+                    if (
+                        len(network_by_key) == before_net
+                        and len(dom_ordered) == before_dom
+                        and i > 2
+                    ):
                         break
 
             print(
-                f"Harvested {len(by_key)} message(s) "
+                f"Harvested network={len(network_by_key)} dom={len(dom_ordered)} "
                 f"(api responses={api_hits}, network_nodes={network_count}, "
-                f"dom={page_info.get('messageCount', 0)}) "
+                f"dom_scrape={page_info.get('messageCount', 0)}) "
                 f"at {self.page.url}",
                 file=sys.stderr,
             )
-            if not by_key:
+            if not network_by_key and not dom_ordered:
                 sample = (page_info.get("bodySample") or "").replace("\n", " ")[:200]
                 print(
                     f"Page debug: title={page_info.get('title')!r} "
@@ -774,8 +902,14 @@ class PoeClient:
         finally:
             self.page.remove_listener("response", on_response)
 
-        messages = _dedupe_messages(list(by_key.values()))
-        if any(m.creation_time_us for m in messages):
+        assembled = _assemble_from_dom_and_network(
+            dom_ordered, list(network_by_key.values())
+        )
+        messages = _dedupe_messages(assembled)
+        # Only chronologically sort when every turn has a timestamp — otherwise
+        # preserve DOM document order (network-only stamps would shove the
+        # bot reply above an untimed user prompt).
+        if messages and all(m.creation_time_us for m in messages):
             messages = _sort_messages(messages)
         return cleanup_messages(
             messages,

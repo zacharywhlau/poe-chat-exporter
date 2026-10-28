@@ -8,6 +8,56 @@ _THINKING_HEADER = re.compile(
     r"(?is)^\s*(?:\*{0,2}Thinking\.{0,3}\*{0,2})\s*$"
 )
 
+# Bare language tags Poe DOM innerText leaves behind (instead of ```bash).
+_FENCE_LANGS = frozenset(
+    {
+        "bash",
+        "sh",
+        "shell",
+        "zsh",
+        "python",
+        "py",
+        "yaml",
+        "yml",
+        "json",
+        "javascript",
+        "js",
+        "typescript",
+        "ts",
+        "html",
+        "css",
+        "sql",
+        "toml",
+        "ini",
+        "gitignore",
+        "dockerfile",
+        "docker",
+        "console",
+        "text",
+        "plaintext",
+        "markdown",
+        "md",
+        "xml",
+        "rust",
+        "go",
+        "ruby",
+        "java",
+        "c",
+        "cpp",
+        "csharp",
+        "swift",
+        "kotlin",
+        "r",
+        "php",
+        "diff",
+        "makefile",
+    }
+)
+
+_CODEY = re.compile(
+    r"[=\$/\\|<>{}\[\]`;]|^\s*#|^\s*[-*]\s|^\s*\d+\.\s+\S|:\s*$|^\s{2,}\S"
+)
+
 
 def strip_thinking(text: str) -> str:
     """Remove leading thinking / chain-of-thought sections from bot text."""
@@ -96,6 +146,128 @@ def normalize_author(author: str, bot_name: str = "", bot_handle: str = "") -> s
     return a
 
 
+def _looks_like_code_line(line: str) -> bool:
+    s = (line or "").rstrip()
+    if not s:
+        return False
+    if _CODEY.search(s):
+        return True
+    # Paths, flags, short shell tokens
+    if s.startswith(("-", "/", ".", "~")):
+        return True
+    if "://" in s or s.endswith((".py", ".yml", ".yaml", ".toml", ".json", ".sh")):
+        return True
+    return False
+
+
+def _looks_like_prose_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if s.lower() in _FENCE_LANGS:
+        return False
+    if _looks_like_code_line(s):
+        return False
+    words = s.split()
+    if len(words) >= 6 and s[0].isupper():
+        return True
+    if len(words) >= 8:
+        return True
+    # Numbered section headings in guideline docs
+    if re.match(r"^\d+\.\s+\S", s) and not _looks_like_code_line(s):
+        return True
+    return False
+
+
+def repair_markdown_fences(text: str) -> str:
+    """Wrap bare language tags (DOM innerText) into proper ``` fences.
+
+    Poe's visible text often renders as::
+
+        bash
+        git status
+
+    instead of::
+
+        ```bash
+        git status
+        ```
+    """
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    in_fence = False
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+
+        lang = stripped.lower()
+        if (
+            not in_fence
+            and lang in _FENCE_LANGS
+            and i + 1 < len(lines)
+            and lines[i + 1].strip()
+            and not lines[i + 1].strip().startswith("```")
+        ):
+            body: list[str] = []
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                ns = nxt.strip()
+                if ns.startswith("```"):
+                    break
+                if ns.lower() in _FENCE_LANGS and body:
+                    break
+                if not ns:
+                    k = j + 1
+                    while k < len(lines) and not lines[k].strip():
+                        k += 1
+                    if k < len(lines) and body:
+                        peek = lines[k].strip()
+                        if peek.lower() in _FENCE_LANGS or _looks_like_prose_line(peek):
+                            break
+                        # Blank inside a block (gitignore / yaml) — keep going
+                        body.append(nxt)
+                        j += 1
+                        continue
+                    break
+                if body and _looks_like_prose_line(ns) and not _looks_like_code_line(ns):
+                    break
+                body.append(nxt)
+                j += 1
+
+            while body and not body[-1].strip():
+                body.pop()
+
+            if body and (
+                any(_looks_like_code_line(b) or b.strip().startswith("#") for b in body)
+                or any(b.strip() for b in body)
+            ):
+                out.append(f"```{stripped}")
+                out.extend(body)
+                out.append("```")
+                i = j
+                continue
+
+        out.append(line)
+        i += 1
+
+    repaired = "\n".join(out)
+    if text.endswith("\n") and not repaired.endswith("\n"):
+        repaired += "\n"
+    return repaired
+
+
 def cleanup_messages(
     messages: list[Message],
     *,
@@ -113,6 +285,8 @@ def cleanup_messages(
                 continue
             if author != "human":
                 text = strip_thinking(text)
+        if author != "human":
+            text = repair_markdown_fences(text)
         text = text.strip()
         if not text:
             continue

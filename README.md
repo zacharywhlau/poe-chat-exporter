@@ -87,7 +87,7 @@ poe-bulk-export export --download-attachments
 poe-bulk-export export -t 'your_p-b_value'
 ```
 
-Chat pages use `https://poe.com/chat/{code}` (not `/c/`, which often 404s). Exports prefer network message JSON over truncated DOM panes, label You/User vs bot, and strip thinking unless `--include-thinking` is set.
+Chat pages use `https://poe.com/chat/{code}` (not `/c/`, which often 404s). Turn order follows the on-page DOM; network JSON upgrades markdown (code fences). Bare language tags from DOM text (e.g. `bash` instead of ` ```bash `) are repaired. Speakers are labeled You/User vs bot, and thinking is stripped unless `--include-thinking` is set.
 
 Images/files stay as inline Markdown (`![…](https://…poecdn…)`) by default — same idea as viewing the chat. Separate attachment files are optional and only kept when the download is real media (not an HTML error page).
 
