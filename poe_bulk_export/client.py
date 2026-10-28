@@ -144,6 +144,16 @@ class HarvestResult:
     notes: list[str] = field(default_factory=list)
     raw: dict[str, Any] | None = None
 
+    @property
+    def unknown_authors(self) -> int:
+        """Messages whose author could not be recognised as you, a bot or Poe."""
+        return sum(1 for m in self.messages if m.author == "unknown")
+
+    @property
+    def degraded(self) -> bool:
+        """Written, but worth a warning: history, formatting or speakers may be off."""
+        return self.complete is not True or self.source != "raw" or self.unknown_authors > 0
+
     def summary(self) -> str:
         sources = ", ".join(f"{k}={v}" for k, v in self.counts.items() if v)
         if self.complete is True:
@@ -154,6 +164,9 @@ class HarvestResult:
             state = "completeness unknown"
         if self.source == "dom-fallback":
             state += ", DOM fallback (formatting may be lossy)"
+        if self.unknown_authors:
+            n = self.unknown_authors
+            state += f", {n} message{'' if n == 1 else 's'} with unknown author"
         text = f"{len(self.messages)} messages"
         if sources:
             text += f" ({sources})"
@@ -227,7 +240,7 @@ class PoeClient:
                 break
             self.page.wait_for_timeout(250)
         if self.formkey:
-            print(f"Connected (formkey: {self.formkey[:8]}…)", file=sys.stderr)
+            print("Connected.", file=sys.stderr)
         else:
             print(
                 "Warning: could not capture poe-formkey; chat listing may fail. "

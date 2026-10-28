@@ -86,7 +86,13 @@ OK   Trip planning [abc123xyz]: 42 messages (store=42, next_data=2), complete (4
 Done: exported 1/1 -> poe_exports/
 ```
 
-`WARN` means the export was written, but either the chat's full history could not be confirmed as loaded, or the page had no raw data and the rendered HTML was used instead. `FAIL` means nothing could be read for that chat. Warnings and failures are listed again at the end.
+`WARN` means the export was written, but something in it may be off:
+
+- the chat's full history could not be confirmed as loaded (`INCOMPLETE` or `completeness unknown`),
+- the page had no raw data and the rendered HTML was used instead (`DOM fallback`), or
+- some messages could not be attributed to you or a bot (`N messages with unknown author`). Those turns are labelled with the chat's bot name, so check them.
+
+`FAIL` means nothing could be read for that chat. Warnings and failures are listed again at the end, followed by a hint to run [`dump`](#troubleshooting) on them.
 
 ## Output
 

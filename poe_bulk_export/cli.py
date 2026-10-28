@@ -275,10 +275,9 @@ def export_cmd(
                     chat, paths, style=style.value, fmt=format.value, strip_thinking=not include_thinking
                 )
                 index.save()
-                degraded = result.complete is not True or result.source != "raw"
-                if degraded:
+                if result.degraded:
                     warnings.append(f"{_chat_label(chat)}: {result.summary()}")
-                status = "WARN" if degraded else "OK  "
+                status = "WARN" if result.degraded else "OK  "
                 files = ", ".join(p.name for p in paths)
                 tqdm.write(
                     f"{status} {_chat_label(chat)}: {result.summary()} ({result.elapsed_s:.1f}s) -> {files}",
@@ -307,10 +306,12 @@ def export_cmd(
         typer.echo("Failed:", err=True)
         for line in failures:
             typer.echo(f"  - {line}", err=True)
+    if warnings or failures:
         typer.echo(
-            "Re-run a failed chat with `poe-bulk-export dump --chat-code CODE` to see what the page contained.",
+            "Run `poe-bulk-export dump --chat-code CODE` for a chat listed above to see what its page contained.",
             err=True,
         )
+    if failures:
         raise typer.Exit(code=1)
 
 

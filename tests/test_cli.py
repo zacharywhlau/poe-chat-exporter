@@ -26,7 +26,7 @@ def fake_open_client(*args, **kwargs):
     yield FakeClient()
 
 
-def fake_harvest(calls: list[str]):
+def fake_harvest(calls: list[str], records: dict | None = None):
     def harvest(client, chat, *, max_pages=200, capture_raw=False, log=None):
         calls.append(chat.chat_code)
         url = f"https://poe.com/chat/{chat.chat_code}"
@@ -35,7 +35,9 @@ def fake_harvest(calls: list[str]):
                 messages=[], complete=False, source="none", counts={"store": 0},
                 chat=None, url=url, notes=[f"no messages found at {url}"],
             )
-        ex = extract_from_relay_records(load_json("workflow_guide_store.json"), ChatTarget(chat_code=GOLDEN_CODE))
+        ex = extract_from_relay_records(
+            records or load_json("workflow_guide_store.json"), ChatTarget(chat_code=GOLDEN_CODE)
+        )
         return HarvestResult(
             messages=ex.messages, complete=True, source="raw",
             counts={"store": 4, "next_data": 2, "network": 0}, chat=ex.chat, url=url, elapsed_s=1.5,
@@ -109,6 +111,26 @@ def test_incremental_skips_unchanged_complete_chats(tmp_path, monkeypatch):
     runner.invoke(cli.app, [*args, "--strip-thinking"])
     runner.invoke(cli.app, [*args, "--strip-thinking"])
     assert calls == [GOLDEN_CODE] * 3
+
+
+def test_unrecognised_authors_are_reported_as_a_warning(tmp_path, monkeypatch):
+    records = load_json("workflow_guide_store.json")
+    for record in records.values():
+        if record.get("__typename") == "Message":
+            for key in ("authorNickname", "author", "authorUser", "authorBot", "bot"):
+                record.pop(key, None)
+    monkeypatch.setattr(cli, "open_client", fake_open_client)
+    monkeypatch.setattr(cli, "harvest_chat", fake_harvest([], records))
+
+    result = runner.invoke(cli.app, ["export", "-t", "tok", "-o", str(tmp_path), "-c", GOLDEN_CODE])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "WARN Python GitHub Workflow Guide [91z1xrschrxyu24wqx]: "
+        "4 messages (store=4, next_data=2), complete, 4 messages with unknown author"
+    ) in result.output
+    assert "Done: exported 1/1, 1 with warnings" in result.output
+    assert "poe-bulk-export dump --chat-code CODE" in result.output
 
 
 def test_logged_out_session_exits_with_code_2(tmp_path, monkeypatch):

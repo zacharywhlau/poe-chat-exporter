@@ -6,7 +6,7 @@ from poe_bulk_export.client import (
     normalize_user_agent,
 )
 from poe_bulk_export.gql_hashes import QUERIES
-from poe_bulk_export.models import Chat
+from poe_bulk_export.models import Chat, Message
 
 
 def test_user_agent_drops_headless_marker_but_keeps_real_version():
@@ -58,11 +58,21 @@ def test_chat_list_pagination_hash_is_the_documented_value():
 
 
 def test_harvest_summary_line():
-    base = {"messages": [object()] * 4, "chat": None, "url": "u"}
-    assert HarvestResult(complete=True, source="raw", counts={"store": 4, "next_data": 2, "network": 0}, **base).summary() == (
-        "4 messages (store=4, next_data=2), complete"
-    )
-    incomplete = HarvestResult(complete=False, source="raw", counts={"store": 4}, **base).summary()
-    assert "INCOMPLETE" in incomplete
-    degraded = HarvestResult(complete=None, source="dom-fallback", counts={"dom": 4}, **base).summary()
-    assert "DOM fallback" in degraded and "unknown" in degraded
+    base = {"messages": [Message(author="human", text="q"), Message(author="bot", text="a")] * 2, "chat": None, "url": "u"}
+    ok = HarvestResult(complete=True, source="raw", counts={"store": 4, "next_data": 2, "network": 0}, **base)
+    assert ok.summary() == "4 messages (store=4, next_data=2), complete"
+    assert not ok.degraded
+    incomplete = HarvestResult(complete=False, source="raw", counts={"store": 4}, **base)
+    assert "INCOMPLETE" in incomplete.summary() and incomplete.degraded
+    fallback = HarvestResult(complete=None, source="dom-fallback", counts={"dom": 4}, **base)
+    assert "DOM fallback" in fallback.summary() and "completeness unknown" in fallback.summary()
+    assert fallback.degraded
+
+
+def test_harvest_summary_reports_unknown_authors():
+    messages = [Message(author=author, text="t") for author in ("unknown", "human", "unknown")]
+    result = HarvestResult(messages=messages, complete=True, source="raw", counts={"store": 3}, chat=None, url="u")
+    assert result.summary() == "3 messages (store=3), complete, 2 messages with unknown author"
+    assert result.degraded
+    result.messages = messages[:2]
+    assert result.summary().endswith(", complete, 1 message with unknown author")
