@@ -243,7 +243,10 @@ def _normalize_for_dedupe(text: str) -> str:
     t = text or ""
     t = re.sub(r"```[\w+-]*\n?", "\n", t)
     t = _BARE_LANG_LINE.sub("\n", t)
-    t = re.sub(r"[*_`#>]+", " ", t)
+    # Horizontal rules and ATX headings differ between DOM plain text and MD
+    t = re.sub(r"(?m)^\s*-{3,}\s*$", "\n", t)
+    t = re.sub(r"(?m)^\s*#{1,6}\s*", "", t)
+    t = re.sub(r"[*_`>~]+", " ", t)
     return " ".join(t.split()).lower()
 
 
@@ -263,6 +266,23 @@ def _same_speaker(a: str, b: str) -> bool:
     return sa == sb
 
 
+def _chunk_hit_ratio(shorter: str, longer: str, chunk: int = 72, step: int = 72) -> float:
+    """How many windows of shorter appear inside longer (markdown-noise tolerant)."""
+    if not shorter:
+        return 0.0
+    if shorter in longer:
+        return 1.0
+    if len(shorter) < chunk:
+        return 1.0 if shorter in longer else 0.0
+    hits = 0
+    total = 0
+    for start in range(0, len(shorter) - chunk + 1, step):
+        total += 1
+        if shorter[start : start + chunk] in longer:
+            hits += 1
+    return hits / max(total, 1)
+
+
 def _overlap_score(a: str, b: str) -> float:
     fa, fb = _normalize_for_dedupe(a), _normalize_for_dedupe(b)
     if not fa or not fb:
@@ -272,6 +292,7 @@ def _overlap_score(a: str, b: str) -> float:
     shorter, longer = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
     if shorter in longer:
         return len(shorter) / max(len(longer), 1)
+
     # Shared prefix — network markdown vs DOM plain text often diverge mid-body
     # after a long identical lead-in.
     i = 0
@@ -283,7 +304,13 @@ def _overlap_score(a: str, b: str) -> float:
         return max(0.6, prefix_ratio)
     if i >= 100:
         return 0.7
-    # Significant shared lead token window
+
+    # Long near-duplicates that diverge early on formatting still share body chunks
+    if len(shorter) >= 400:
+        hit = _chunk_hit_ratio(shorter, longer)
+        if hit >= 0.55:
+            return max(0.65, hit)
+
     n = min(120, len(fa), len(fb))
     if n >= 40 and fa[:n] == fb[:n]:
         return 0.8
@@ -367,7 +394,7 @@ def _dedupe_messages(messages: list[Message]) -> list[Message]:
                 replaced = True
                 break
             score = _overlap_score(msg.text, prev.text)
-            if score >= 0.55:
+            if score >= 0.5:
                 kept[i] = _prefer_message(prev, msg)
                 replaced = True
                 break
@@ -389,6 +416,13 @@ def _dedupe_messages(messages: list[Message]) -> list[Message]:
         if not replaced:
             kept.append(msg)
     return kept
+
+
+def _collapse_duplicate_turns(messages: list[Message]) -> list[Message]:
+    """Final pass: merge adjacent/same-speaker near-duplicates after cleanup."""
+    if len(messages) < 2:
+        return messages
+    return _dedupe_messages(messages)
 
 
 def _assemble_from_dom_and_network(
@@ -911,12 +945,14 @@ class PoeClient:
         # bot reply above an untimed user prompt).
         if messages and all(m.creation_time_us for m in messages):
             messages = _sort_messages(messages)
-        return cleanup_messages(
+        cleaned = cleanup_messages(
             messages,
             include_thinking=include_thinking,
             bot_name=chat.bot,
             bot_handle=chat.bot_handle,
         )
+        # Fence repair can make DOM/network copies comparable only after cleanup.
+        return _collapse_duplicate_turns(cleaned)
 
 
 def list_chats(client: PoeClient, limit: int | None = None) -> list[Chat]:
@@ -1015,12 +1051,13 @@ def _fetch_messages_graphql(
     messages: list[Message] = []
     for batch in reversed(batches):
         messages.extend(batch)
-    return cleanup_messages(
+    cleaned = cleanup_messages(
         messages,
         include_thinking=include_thinking,
         bot_name=chat.bot,
         bot_handle=chat.bot_handle,
     )
+    return _collapse_duplicate_turns(_dedupe_messages(cleaned))
 
 
 def fetch_messages(
@@ -1029,7 +1066,7 @@ def fetch_messages(
     *,
     include_thinking: bool = False,
 ) -> list[Message]:
-    """Prefer browser chat-page harvest; use GraphQL only after it has proven OK."""
+    """Prefer browser chat-page harvest; GraphQL is fallback / later-chat speedup."""
     if client._graphql_messages_ok:
         try:
             return _fetch_messages_graphql(
@@ -1045,8 +1082,8 @@ def fetch_messages(
         chat, include_thinking=include_thinking
     )
     if messages:
-        # Optional speed-up: if signed GraphQL works, use it for later chats.
-        # Failures here are normal — page harvest already succeeded.
+        # Probe GraphQL for later chats, but never replace this chat's harvest —
+        # GraphQL often returns plain + markdown duplicates of the same bot turn.
         if not client._graphql_messages_ok:
             try:
                 gql_msgs = _fetch_messages_graphql(
@@ -1055,10 +1092,10 @@ def fetch_messages(
                 if gql_msgs:
                     client._graphql_messages_ok = True
                     print(
-                        "GraphQL message fetch OK — using it for remaining chats",
+                        "GraphQL message fetch OK — will try it for remaining chats "
+                        "(keeping page harvest for this chat)",
                         file=sys.stderr,
                     )
-                    return gql_msgs
             except Exception:
                 pass
         return messages

@@ -1,9 +1,11 @@
 from poe_bulk_export.client import (
     _assemble_from_dom_and_network,
     _chat_urls,
+    _collapse_duplicate_turns,
     _dedupe_messages,
     _looks_like_ui_chrome,
     _normalize_for_dedupe,
+    _overlap_score,
     _walk_message_nodes,
 )
 from poe_bulk_export.cleanup import cleanup_messages
@@ -166,3 +168,58 @@ def test_assemble_workflow_guide_order_and_fences():
     assert messages[1].text.count("```bash") >= 1
     # No duplicate bot answer
     assert sum(1 for m in messages if m.author == "bot") == 1
+
+
+def test_collapse_plain_and_markdown_bot_duplicates():
+    """Regression: export -2 had You + plain DOM bot + markdown network bot."""
+    plain = (
+        "Git & GitHub Team Workflow for Python Projects\n\n"
+        "A professional team guideline — clear procedures, syntax explanations, "
+        "and rationale\n\n"
+        "1. Purpose and Scope\n\n"
+        "This document defines how our team uses Git and GitHub to collaborate "
+        "on Python projects. It covers naming conventions, the day-to-day "
+        "development cycle, pull requests and code review, merging strategy, "
+        "releases, and Python-specific repository hygiene. Every command is "
+        "explained so that new team members can follow the procedure.\n\n"
+        "```bash\n"
+        'git config --global user.name "Ada Lovelace"\n'
+        "```\n\n"
+        "Here git config writes settings for all repositories on this machine "
+        "and that is why we prefer the global scope for identity setup.\n"
+    )
+    markdown = (
+        "# Git & GitHub Team Workflow for Python Projects\n\n"
+        "**A professional team guideline — clear procedures, syntax explanations, "
+        "and rationale**\n\n"
+        "---\n\n"
+        "## 1. Purpose and Scope\n\n"
+        "This document defines how our team uses Git and GitHub to collaborate "
+        "on Python projects. It covers naming conventions, the day-to-day "
+        "development cycle, pull requests and code review, merging strategy, "
+        "releases, and Python-specific repository hygiene. Every command is "
+        "explained so that new team members can follow the procedure.\n\n"
+        "```bash\n"
+        'git config --global user.name "Ada Lovelace"\n'
+        "```\n\n"
+        "Here `git config` writes settings for all repositories on this machine "
+        "and that is why we prefer the global scope for identity setup.\n"
+    )
+    assert _overlap_score(plain, markdown) >= 0.5
+    msgs = [
+        Message(author="human", text="Draft the workflow guide", source="dom"),
+        Message(author="bot", text=plain, source="dom"),
+        Message(
+            author="bot",
+            text=markdown,
+            message_id=9,
+            creation_time_us=1,
+            source="network",
+        ),
+    ]
+    out = _collapse_duplicate_turns(cleanup_messages(msgs, bot_name="Claude-Fable-5"))
+    assert len(out) == 2
+    assert out[0].author == "human"
+    assert out[1].author == "bot"
+    assert out[1].source == "network"
+    assert "## 1. Purpose" in out[1].text
