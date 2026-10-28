@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-time (or after moving the folder): create .venv and install the CLI.
+# One-time (or after moving the folder): recreate .venv and install the CLI.
 cd "$(dirname "$0")"
 # shellcheck disable=SC1091
 source ./_lib.sh
@@ -18,11 +18,20 @@ else
   exit 1
 fi
 
-echo "Using: $PY ($("$PY" --version 2>&1))"
+echo "Using builder: $PY ($("$PY" --version 2>&1))"
+echo "Removing old .venv (if any)…"
+rm -rf .venv
+
 "$PY" -m venv .venv
 .venv/bin/python -m pip install -U pip
-.venv/bin/pip install -e .
+.venv/bin/python -m pip install -e .
 .venv/bin/playwright install chromium
+
+if ! .venv/bin/python -c "import poe_bulk_export"; then
+  _red "Install finished but import still fails."
+  pause_at_end
+  exit 1
+fi
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
@@ -32,5 +41,6 @@ else
 fi
 
 echo
-_green "Setup done. Next: edit .env if needed, then use List Chats or Export All Chats."
+_green "Setup done. Next: use List Chats or Export All Chats."
+.venv/bin/python -m poe_bulk_export --version 2>/dev/null || true
 pause_at_end
