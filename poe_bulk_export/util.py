@@ -63,10 +63,19 @@ def chat_export_stem(
     date = earliest_message_date(messages or [])
     model = sanitize_filename_component(bot or "unknown", max_len=48)
     title_part = sanitize_filename_component(title or "Untitled", max_len=80)
-    stem = f"{date}_{model}_{title_part}"
+    parts = [date, model, title_part]
+    stem = "_".join(parts)
     if chat_code:
+        # Keep a clear separator before the short id (do not collapse __).
         stem = f"{stem}__{sanitize_filename_component(chat_code, max_len=24)}"
-    return sanitize_filename_component(stem, max_len=180)
+    if len(stem) > 180:
+        # Trim title segment if the full stem is too long
+        overflow = len(stem) - 180
+        title_part = title_part[: max(20, len(title_part) - overflow)]
+        stem = "_".join([date, model, title_part])
+        if chat_code:
+            stem = f"{stem}__{sanitize_filename_component(chat_code, max_len=24)}"
+    return stem
 
 
 def unique_path(directory: Path, stem: str, suffix: str) -> Path:

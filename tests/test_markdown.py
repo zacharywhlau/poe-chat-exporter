@@ -91,4 +91,6 @@ def test_write_markdown(tmp_path: Path):
     assert path.suffix == ".md"
     assert "Sample Poe Chat" in path.read_text(encoding="utf-8")
     # date_model_title__code
-    assert path.name.startswith("2024-01-15_Claude-Sonnet-4.5_Sample_Poe_Chat__")
+    assert path.name.startswith(
+        "2024-01-15_Claude-Sonnet-4.5_Sample_Poe_Chat__abc123"
+    )
