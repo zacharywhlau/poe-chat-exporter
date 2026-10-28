@@ -10,7 +10,10 @@ import typer
 from tqdm import tqdm
 
 from poe_bulk_export import __version__
-from poe_bulk_export.attachments import download_chat_attachments
+from poe_bulk_export.attachments import (
+    download_chat_attachments,
+    ensure_inline_markdown_embeds,
+)
 from poe_bulk_export.client import fetch_messages, list_chats, open_client
 from poe_bulk_export.json_export import write_json
 from poe_bulk_export.markdown import write_markdown
@@ -128,7 +131,10 @@ def export_cmd(
     download_attachments: bool = typer.Option(
         False,
         "--download-attachments",
-        help="Download media/files and rewrite Markdown links to local paths.",
+        help=(
+            "Optional offline copy of real images/files only. "
+            "Default keeps CDN URLs embedded in Markdown (like the chat)."
+        ),
     ),
     headless: bool = typer.Option(
         True, "--headless/--headed", help="Run Chromium headless."
@@ -158,8 +164,15 @@ def export_cmd(
                 chat.messages = fetch_messages(
                     client, chat, include_thinking=include_thinking
                 )
+                # Keep images/files as inline Markdown links (chat-like).
+                ensure_inline_markdown_embeds(chat)
                 if download_attachments:
-                    download_chat_attachments(chat, output, cookies=cookies)
+                    n = download_chat_attachments(chat, output, cookies=cookies)
+                    if n:
+                        tqdm.write(
+                            f"Saved {n} media file(s) for '{chat.title}'",
+                            file=sys.stderr,
+                        )
 
                 if format in (ExportFormat.markdown, ExportFormat.both):
                     write_markdown(chat, output, style=style.value)

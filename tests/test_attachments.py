@@ -4,15 +4,50 @@ from pathlib import Path
 
 import httpx
 
-from poe_bulk_export.attachments import download_chat_attachments
+from poe_bulk_export.attachments import (
+    download_chat_attachments,
+    ensure_inline_markdown_embeds,
+    is_skip_attachment_url,
+)
 from poe_bulk_export.models import Attachment, Chat, Message
 
 
-def test_download_chat_attachments(tmp_path: Path, monkeypatch):
+def test_skip_non_media_urls():
+    assert is_skip_attachment_url("https://poe.com/export-chat")
+    assert is_skip_attachment_url("https://export.tools/")
+    assert not is_skip_attachment_url("https://qph.cf2.poecdn.net/pic.png")
+
+
+def test_ensure_inline_markdown_embeds():
+    chat = Chat(
+        chat_id=1,
+        chat_code="xyz",
+        node_id="id",
+        title="T",
+        bot="Bot",
+        messages=[
+            Message(
+                author="bot",
+                text="see this",
+                attachments=[
+                    Attachment(
+                        url="https://qph.cf2.poecdn.net/pic.png",
+                        name="pic.png",
+                        kind="image",
+                    )
+                ],
+            )
+        ],
+    )
+    ensure_inline_markdown_embeds(chat)
+    assert "![pic.png](https://qph.cf2.poecdn.net/pic.png)" in chat.messages[0].text
+
+
+def test_download_rejects_html(tmp_path: Path, monkeypatch):
     class FakeResponse:
         def __init__(self):
-            self.content = b"fake-image-bytes"
-            self.headers = {"content-type": "image/png"}
+            self.content = b"<!DOCTYPE html><html><body>Error</body></html>"
+            self.headers = {"content-type": "text/html; charset=utf-8"}
 
         def raise_for_status(self):
             return None
@@ -28,7 +63,6 @@ def test_download_chat_attachments(tmp_path: Path, monkeypatch):
             return False
 
         def get(self, url):
-            assert url.startswith("https://")
             return FakeResponse()
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
@@ -56,8 +90,5 @@ def test_download_chat_attachments(tmp_path: Path, monkeypatch):
     )
 
     count = download_chat_attachments(chat, tmp_path)
-    assert count == 1
-    att = chat.messages[0].attachments[0]
-    assert att.local_path is not None
-    assert att.local_path.startswith("attachments/xyz/")
-    assert (tmp_path / att.local_path).exists()
+    assert count == 0
+    assert chat.messages[0].attachments[0].local_path is None

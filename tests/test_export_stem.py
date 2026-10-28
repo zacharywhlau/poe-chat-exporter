@@ -13,10 +13,22 @@ def test_earliest_message_date():
         Message(author="bot", text="yo", creation_time_us=1705398600000000),
     ]
     assert earliest_message_date(messages) == "2024-01-15"
-    assert earliest_message_date([]) == "undated"
+    assert earliest_message_date([]) is None
     assert (
         earliest_message_date([], fallback_time_us=1705312200000000) == "2024-01-15"
     )
+
+
+def test_stem_omits_date_when_unknown():
+    stem = chat_export_stem(
+        title="Python Learning Project",
+        bot="Claude-Fable-5",
+        messages=[],
+        chat_code="93ozu1d1q42v5qtcou",
+    )
+    assert not stem.startswith("undated")
+    assert stem.startswith("Claude-Fable-5_Python_Learning_Project__")
+
 
 
 def test_coerce_ms_and_seconds():

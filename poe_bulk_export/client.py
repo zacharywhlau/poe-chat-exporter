@@ -8,6 +8,7 @@ from typing import Any
 
 from playwright.sync_api import Playwright, sync_playwright
 
+from poe_bulk_export.attachments import is_skip_attachment_url
 from poe_bulk_export.cleanup import cleanup_messages
 from poe_bulk_export.gql_hashes import QUERIES
 from poe_bulk_export.models import Attachment, Chat, Message
@@ -80,7 +81,7 @@ def _attachments_from_node(node: dict[str, Any], text: str) -> list[Attachment]:
                 or item.get("downloadUrl")
                 or ""
             )
-            if not url or url in seen:
+            if not url or url in seen or is_skip_attachment_url(url):
                 continue
             seen.add(url)
             name = (
@@ -93,9 +94,10 @@ def _attachments_from_node(node: dict[str, Any], text: str) -> list[Attachment]:
             )
 
     for name, url in extract_urls_from_text(text):
-        if url in seen:
+        if url in seen or is_skip_attachment_url(url):
             continue
-        if not any(x in url.lower() for x in ("poecdn", "poe.com")):
+        # Real media CDNs only — not poe.com HTML pages
+        if "poecdn" not in url.lower():
             continue
         seen.add(url)
         attachments.append(
@@ -909,6 +911,8 @@ def fetch_messages(
         chat, include_thinking=include_thinking
     )
     if messages:
+        # Optional speed-up: if signed GraphQL works, use it for later chats.
+        # Failures here are normal — page harvest already succeeded.
         if not client._graphql_messages_ok:
             try:
                 gql_msgs = _fetch_messages_graphql(
@@ -921,12 +925,8 @@ def fetch_messages(
                         file=sys.stderr,
                     )
                     return gql_msgs
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"GraphQL still unavailable ({exc}); "
-                    "continuing with page harvest per chat",
-                    file=sys.stderr,
-                )
+            except Exception:
+                pass
         return messages
 
     try:

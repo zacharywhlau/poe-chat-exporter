@@ -61,8 +61,8 @@ def earliest_message_date(
     messages: list | None = None,
     *,
     fallback_time_us: int | None = None,
-) -> str:
-    """Return YYYY-MM-DD (UTC) from message times, chat activity, else undated."""
+) -> str | None:
+    """Return YYYY-MM-DD (UTC) from message/chat times, or None if unknown."""
     times: list[int] = []
     for msg in messages or []:
         raw = getattr(msg, "creation_time_us", None)
@@ -75,12 +75,12 @@ def earliest_message_date(
     if fb is not None:
         times.append(fb)
     if not times:
-        return "undated"
+        return None
     try:
         dt = datetime.fromtimestamp(min(times) / 1_000_000, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d")
     except (OSError, OverflowError, ValueError):
-        return "undated"
+        return None
 
 
 def chat_export_stem(
@@ -91,22 +91,22 @@ def chat_export_stem(
     chat_code: str = "",
     fallback_time_us: int | None = None,
 ) -> str:
-    """Informative stem: {date}_{model}_{title}[__{chat_code}]."""
+    """Stem: [{date}_]{model}_{title}[__{chat_code}] — omit date if unknown."""
     date = earliest_message_date(
         messages or [], fallback_time_us=fallback_time_us
     )
     model = sanitize_filename_component(bot or "unknown", max_len=48)
     title_part = sanitize_filename_component(title or "Untitled", max_len=80)
-    parts = [date, model, title_part]
+    parts = [p for p in (date, model, title_part) if p]
     stem = "_".join(parts)
     if chat_code:
         # Keep a clear separator before the short id (do not collapse __).
         stem = f"{stem}__{sanitize_filename_component(chat_code, max_len=24)}"
     if len(stem) > 180:
-        # Trim title segment if the full stem is too long
         overflow = len(stem) - 180
         title_part = title_part[: max(20, len(title_part) - overflow)]
-        stem = "_".join([date, model, title_part])
+        parts = [p for p in (date, model, title_part) if p]
+        stem = "_".join(parts)
         if chat_code:
             stem = f"{stem}__{sanitize_filename_component(chat_code, max_len=24)}"
     return stem

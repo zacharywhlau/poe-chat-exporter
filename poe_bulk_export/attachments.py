@@ -7,23 +7,67 @@ from urllib.parse import urlparse
 
 import httpx
 
-from poe_bulk_export.models import Chat
+from poe_bulk_export.models import Attachment, Chat
 from poe_bulk_export.util import guess_attachment_name, sanitize_filename
 
 
 _SAFE_EXT = re.compile(r"^[a-zA-Z0-9]{1,8}$")
+_MEDIA_TYPES = (
+    "image/",
+    "video/",
+    "audio/",
+    "application/pdf",
+    "application/zip",
+    "application/octet-stream",
+)
+_SKIP_HOST_SNIPPETS = (
+    "poe.com/export",
+    "poe.com/savethischat",
+    "poe.com/savechats",
+    "export.tools",
+    "poe.com/login",
+    "poe.com/signup",
+)
 
 
 def _extension_for(url: str, content_type: str | None, name: str) -> str:
     for candidate in (Path(name).suffix, Path(urlparse(url).path).suffix):
         ext = candidate.lstrip(".").lower()
-        if ext and _SAFE_EXT.match(ext):
+        if ext and _SAFE_EXT.match(ext) and ext not in {"html", "htm", "js", "css"}:
             return f".{ext}"
     if content_type:
-        guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
-        if guessed:
+        ctype = content_type.split(";")[0].strip().lower()
+        if ctype.startswith("image/"):
+            guessed = mimetypes.guess_extension(ctype) or ".img"
             return guessed
+        if ctype.startswith("video/"):
+            return mimetypes.guess_extension(ctype) or ".mp4"
+        if ctype.startswith("audio/"):
+            return mimetypes.guess_extension(ctype) or ".bin"
+        if ctype == "application/pdf":
+            return ".pdf"
     return ".bin"
+
+
+def _looks_like_real_media(content_type: str | None, content: bytes) -> bool:
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if ctype.startswith(("text/html", "text/plain", "application/json", "text/css")):
+        return False
+    if any(ctype.startswith(prefix) or ctype == prefix for prefix in _MEDIA_TYPES):
+        # Guard: HTML mistaken as octet-stream
+        head = content[:200].lstrip().lower()
+        if head.startswith((b"<!doctype html", b"<html")):
+            return False
+        return True
+    # Sniff images
+    if content.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF8", b"RIFF")):
+        return True
+    return False
+
+
+def is_skip_attachment_url(url: str) -> bool:
+    low = (url or "").lower()
+    return any(s in low for s in _SKIP_HOST_SNIPPETS)
 
 
 def download_chat_attachments(
@@ -33,9 +77,10 @@ def download_chat_attachments(
     cookies: dict[str, str] | None = None,
     timeout: float = 60.0,
 ) -> int:
-    """Download attachments into output_dir/attachments/<chat_code>/ and rewrite local_path.
+    """Download real media only; skip HTML/error pages.
 
-    Returns the number of files successfully downloaded.
+    Prefer leaving CDN URLs embedded in Markdown (chat-like). This helper is
+    for offline archives and refuses non-media responses.
     """
     if not any(m.attachments for m in chat.messages):
         return 0
@@ -47,9 +92,12 @@ def download_chat_attachments(
     downloaded = 0
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (compatible; poe-bulk-export/0.1; +https://poe.com)"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
         ),
         "Referer": "https://poe.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
 
     with httpx.Client(
@@ -60,7 +108,7 @@ def download_chat_attachments(
     ) as client:
         for message in chat.messages:
             for idx, att in enumerate(message.attachments):
-                if not att.url:
+                if not att.url or is_skip_attachment_url(att.url):
                     continue
                 try:
                     resp = client.get(att.url)
@@ -68,18 +116,41 @@ def download_chat_attachments(
                 except Exception:
                     continue
 
+                ctype = resp.headers.get("content-type")
+                if not _looks_like_real_media(ctype, resp.content):
+                    continue
+
                 base = sanitize_filename(
                     Path(att.name).stem or guess_attachment_name(att.url, "file")
                 )
                 mid = message.message_id if message.message_id is not None else "msg"
-                ext = _extension_for(
-                    att.url, resp.headers.get("content-type"), att.name
-                )
+                ext = _extension_for(att.url, ctype, att.name)
+                if ext in {".html", ".htm"}:
+                    continue
                 filename = f"msg-{mid}-{idx}-{base}{ext}"
                 dest = att_dir / filename
                 dest.write_bytes(resp.content)
-                # Relative path from the chat .md/.json sitting in output_dir
                 att.local_path = f"attachments/{code}/{filename}"
                 downloaded += 1
 
     return downloaded
+
+
+def ensure_inline_markdown_embeds(chat: Chat) -> None:
+    """Make sure each attachment URL appears inline in message text (chat-like)."""
+    for message in chat.messages:
+        text = message.text or ""
+        for att in message.attachments:
+            if not att.url or is_skip_attachment_url(att.url):
+                continue
+            if att.url in text:
+                continue
+            label = att.name or "attachment"
+            if att.kind == "image" or any(
+                att.url.lower().endswith(ext)
+                for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")
+            ):
+                text = f"{text.rstrip()}\n\n![{label}]({att.url})"
+            else:
+                text = f"{text.rstrip()}\n\n[{label}]({att.url})"
+        message.text = text

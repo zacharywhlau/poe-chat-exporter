@@ -75,12 +75,13 @@ poe-bulk-export export
 poe-bulk-export export -f json -o my_chats
 poe-bulk-export export -f both -l 10
 
-# Download attachments into the output folder
-poe-bulk-export export --download-attachments
-
 # Markdown closer to @export-chat (User: / Bot: turns); strip thinking (default)
 poe-bulk-export export --style export-chat
 poe-bulk-export export --include-thinking   # keep reasoning blocks
+
+# Optional: save real images offline (skips HTML error pages). Default keeps
+# CDN URLs embedded in the Markdown, like the chat UI.
+poe-bulk-export export --download-attachments
 
 # Pass token explicitly
 poe-bulk-export export -t 'your_p-b_value'
@@ -88,8 +89,11 @@ poe-bulk-export export -t 'your_p-b_value'
 
 Chat pages use `https://poe.com/chat/{code}` (not `/c/`, which often 404s). Exports prefer network message JSON over truncated DOM panes, label You/User vs bot, and strip thinking unless `--include-thinking` is set.
 
-Files are named `{YYYY-MM-DD}_{model}_{title}__{chatCode}.md` using the earliest message date (UTC), for example:
+Images/files stay as inline Markdown (`![…](https://…poecdn…)`) by default — same idea as viewing the chat. Separate attachment files are optional and only kept when the download is real media (not an HTML error page).
 
+Files are named `{model}_{title}__{chatCode}.md`, with a leading `{YYYY-MM-DD}_` only when a chat date is known:
+
+`Claude-Fable-5_Python_Learning_Project__93ozu1d1q42v5qtcou.md`  
 `2024-07-09_Claude-Fable-5_Python_Learning_Project__93ozu1d1q42v5qtcou.md`
 
 
