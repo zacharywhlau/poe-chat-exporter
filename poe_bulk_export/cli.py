@@ -17,6 +17,7 @@ from poe_bulk_export.attachments import (
 from poe_bulk_export.client import fetch_messages, list_chats, open_client
 from poe_bulk_export.json_export import write_json
 from poe_bulk_export.markdown import write_markdown
+from poe_bulk_export.models import Chat
 
 app = typer.Typer(
     add_completion=False,
@@ -50,6 +51,19 @@ def _resolve_token(token: Optional[str]) -> str:
 
 def _resolve_lat(lat: Optional[str]) -> Optional[str]:
     return lat or os.environ.get("POE_LAT") or None
+
+
+def filter_chats_by_codes(
+    chats: list[Chat],
+    chat_codes: list[str] | None,
+) -> list[Chat]:
+    """Keep chats whose chat_code matches any requested code (case-insensitive)."""
+    if not chat_codes:
+        return chats
+    wanted = {c.strip().lower() for c in chat_codes if c and c.strip()}
+    if not wanted:
+        return chats
+    return [c for c in chats if (c.chat_code or "").lower() in wanted]
 
 
 def _version_callback(value: bool) -> None:
@@ -103,6 +117,15 @@ def export_cmd(
     lat: Optional[str] = typer.Option(
         None, "--lat", help="Optional p-lat cookie (or POE_LAT)."
     ),
+    chat_code: Optional[list[str]] = typer.Option(
+        None,
+        "--chat-code",
+        "-c",
+        help=(
+            "Export only this chat code (repeatable). "
+            "Example: --chat-code 91z1xrschrxyu24wqx"
+        ),
+    ),
     limit: Optional[int] = typer.Option(
         None, "--limit", "-l", help="Max conversations to export."
     ),
@@ -151,8 +174,29 @@ def export_cmd(
 
     with open_client(pb, lat=plat, headless=headless) as client:
         typer.echo("Fetching conversation list…", err=True)
-        chats = list_chats(client, limit=limit)
+        # When filtering by code, fetch the full list then match — --limit
+        # alone would miss chats outside the first N.
+        list_limit = None if chat_code else limit
+        chats = list_chats(client, limit=list_limit)
         typer.echo(f"Found {len(chats)} conversation(s)", err=True)
+
+        if chat_code:
+            wanted = [c.strip() for c in chat_code if c and c.strip()]
+            chats = filter_chats_by_codes(chats, wanted)
+            if not chats:
+                typer.echo(
+                    "No conversations matched --chat-code "
+                    f"{', '.join(wanted)}. "
+                    "Check the code from `poe-bulk-export list`.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            typer.echo(
+                f"Matched {len(chats)} chat(s) for --chat-code",
+                err=True,
+            )
+        elif limit is not None:
+            chats = chats[:limit]
 
         if not chats:
             typer.echo("No conversations to export.")

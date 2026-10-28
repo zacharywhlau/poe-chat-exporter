@@ -75,6 +75,11 @@ poe-bulk-export export
 poe-bulk-export export -f json -o my_chats
 poe-bulk-export export -f both -l 10
 
+# Single chat (code from `poe-bulk-export list`, or the __code suffix in a filename)
+poe-bulk-export export --chat-code 91z1xrschrxyu24wqx
+# After git pull, reinstall so the CLI picks up new flags:
+#   pip install -e .
+
 # Markdown closer to @export-chat (User: / Bot: turns); strip thinking (default)
 poe-bulk-export export --style export-chat
 poe-bulk-export export --include-thinking   # keep reasoning blocks
