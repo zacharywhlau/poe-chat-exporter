@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
@@ -10,6 +11,26 @@ from playwright.sync_api import Playwright, sync_playwright
 from poe_bulk_export.gql_hashes import QUERIES
 from poe_bulk_export.models import Attachment, Chat, Message
 from poe_bulk_export.util import extract_urls_from_text, guess_kind, guess_attachment_name
+
+# Poe signs each gql_POST body with md5(body + formkey + salt).
+# Reusing a tag from a different request yields HTTP 400.
+_POE_TAG_SALT = "4LxgHM6KpFqokX0Ox"
+
+
+def _payload_json(query_name: str, variables: dict[str, Any]) -> str:
+    """Compact JSON matching Poe client signing (orjson-style, no spaces)."""
+    payload = {
+        "queryName": query_name,
+        "variables": variables,
+        "extensions": {"hash": QUERIES[query_name]},
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+
+def _poe_tag_id(payload_str: str, formkey: str) -> str:
+    return hashlib.md5(
+        (payload_str + formkey + _POE_TAG_SALT).encode("utf-8")
+    ).hexdigest()
 
 
 class PoeClient:
@@ -57,10 +78,11 @@ class PoeClient:
 
         def on_request(request: Any) -> None:
             if "gql_POST" in request.url and self._headers is None:
+                # Keep poe-* headers except tag-id (must be signed per body).
                 self._headers = {
                     k: v
                     for k, v in request.headers.items()
-                    if k.startswith("poe-")
+                    if k.startswith("poe-") and k != "poe-tag-id"
                 }
 
         self.page.on("request", on_request)
@@ -82,12 +104,12 @@ class PoeClient:
                 break
             self.page.wait_for_timeout(500)
 
-        if self._headers:
-            formkey = self._headers.get("poe-formkey", "n/a")
-            print(f"Connected (formkey: {formkey[:8]}…)", file=sys.stderr)
+        self.formkey = (self._headers or {}).get("poe-formkey", "")
+        if self.formkey:
+            print(f"Connected (formkey: {self.formkey[:8]}…)", file=sys.stderr)
         else:
             print(
-                "Warning: could not capture poe-* headers; GraphQL may fail. "
+                "Warning: could not capture poe-formkey; GraphQL may fail. "
                 "Try: poe-bulk-export list --headed",
                 file=sys.stderr,
             )
@@ -107,29 +129,27 @@ class PoeClient:
                 f"Unknown query {query_name!r}. Add its hash in gql_hashes.py."
             )
 
+        payload_str = _payload_json(query_name, variables)
         headers = dict(self._headers or {})
         headers["Content-Type"] = "application/json"
         headers["poe-queryname"] = query_name
-
-        payload = {
-            "queryName": query_name,
-            "variables": variables,
-            "extensions": {"hash": QUERIES[query_name]},
-        }
+        if self.formkey:
+            headers["poe-formkey"] = self.formkey
+            headers["poe-tag-id"] = _poe_tag_id(payload_str, self.formkey)
 
         attempt = 0
         while True:
             attempt += 1
             result = self.page.evaluate(
-                """async ([payload, headers]) => {
+                """async ([payloadStr, headers]) => {
                     const resp = await fetch("/api/gql_POST", {
                         method: "POST",
                         headers: headers,
-                        body: JSON.stringify(payload),
+                        body: payloadStr,
                     });
                     return {status: resp.status, body: await resp.text()};
                 }""",
-                [payload, headers],
+                [payload_str, headers],
             )
 
             status = result["status"]
