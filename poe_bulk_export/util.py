@@ -30,19 +30,50 @@ def sanitize_filename_component(name: str, max_len: int = 80) -> str:
     return cleaned[:max_len]
 
 
-def earliest_message_date(messages: list) -> str:
-    """Return YYYY-MM-DD (UTC) from the earliest message timestamp, else undated."""
+def coerce_poe_time_us(value: object) -> int | None:
+    """Normalize Poe timestamps to epoch microseconds."""
+    if value is None or value == "":
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        # ISO string fallback
+        try:
+            s = str(value).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1_000_000)
+        except ValueError:
+            return None
+    if n <= 0:
+        return None
+    # Seconds → µs
+    if n < 10_000_000_000:  # before ~2286 in seconds
+        return n * 1_000_000
+    # Milliseconds → µs
+    if n < 10_000_000_000_000:  # 13 digits
+        return n * 1_000
+    return n
+
+
+def earliest_message_date(
+    messages: list | None = None,
+    *,
+    fallback_time_us: int | None = None,
+) -> str:
+    """Return YYYY-MM-DD (UTC) from message times, chat activity, else undated."""
     times: list[int] = []
     for msg in messages or []:
         raw = getattr(msg, "creation_time_us", None)
         if raw is None and isinstance(msg, dict):
             raw = msg.get("creation_time_us") or msg.get("time_epoch_us")
-        if raw is None or raw == "":
-            continue
-        try:
-            times.append(int(raw))
-        except (TypeError, ValueError):
-            continue
+        coerced = coerce_poe_time_us(raw)
+        if coerced is not None:
+            times.append(coerced)
+    fb = coerce_poe_time_us(fallback_time_us)
+    if fb is not None:
+        times.append(fb)
     if not times:
         return "undated"
     try:
@@ -58,9 +89,12 @@ def chat_export_stem(
     bot: str,
     messages: list | None = None,
     chat_code: str = "",
+    fallback_time_us: int | None = None,
 ) -> str:
     """Informative stem: {date}_{model}_{title}[__{chat_code}]."""
-    date = earliest_message_date(messages or [])
+    date = earliest_message_date(
+        messages or [], fallback_time_us=fallback_time_us
+    )
     model = sanitize_filename_component(bot or "unknown", max_len=48)
     title_part = sanitize_filename_component(title or "Untitled", max_len=80)
     parts = [date, model, title_part]

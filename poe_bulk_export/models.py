@@ -46,6 +46,8 @@ class Chat:
     bot: str
     bot_handle: str = ""
     messages: list[Message] = field(default_factory=list)
+    # From chat-list metadata when message timestamps are missing
+    activity_time_us: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,5 +57,6 @@ class Chat:
             "title": self.title,
             "bot": self.bot,
             "botHandle": self.bot_handle,
+            "activity_time_us": self.activity_time_us,
             "messages": [m.to_dict() for m in self.messages],
         }

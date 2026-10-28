@@ -11,7 +11,12 @@ from playwright.sync_api import Playwright, sync_playwright
 from poe_bulk_export.cleanup import cleanup_messages
 from poe_bulk_export.gql_hashes import QUERIES
 from poe_bulk_export.models import Attachment, Chat, Message
-from poe_bulk_export.util import extract_urls_from_text, guess_attachment_name, guess_kind
+from poe_bulk_export.util import (
+    coerce_poe_time_us,
+    extract_urls_from_text,
+    guess_attachment_name,
+    guess_kind,
+)
 
 # Poe signs each gql_POST body with md5(body + formkey + salt).
 _TAG_SALTS = [
@@ -100,6 +105,24 @@ def _attachments_from_node(node: dict[str, Any], text: str) -> list[Attachment]:
     return attachments
 
 
+def _node_time_us(node: dict[str, Any]) -> int | None:
+    for key in (
+        "creationTime",
+        "createdAt",
+        "timestamp",
+        "time",
+        "sentAt",
+        "updatedAt",
+        "lastMessageTime",
+        "lastMessageCreationTime",
+    ):
+        if key in node and node.get(key) is not None:
+            coerced = coerce_poe_time_us(node.get(key))
+            if coerced is not None:
+                return coerced
+    return None
+
+
 def _message_from_node(node: dict[str, Any]) -> Message:
     text = node.get("text") or ""
     return Message(
@@ -107,7 +130,7 @@ def _message_from_node(node: dict[str, Any]) -> Message:
         text=text,
         message_id=node.get("messageId"),
         content_type=node.get("contentType"),
-        creation_time_us=node.get("creationTime"),
+        creation_time_us=_node_time_us(node),
         attachments=_attachments_from_node(node, text),
         source="network",
     )
@@ -208,6 +231,29 @@ def _normalize_for_dedupe(text: str) -> str:
     return " ".join((text or "").split()).lower()
 
 
+def _merge_metadata(winner: Message, other: Message) -> Message:
+    """Keep timestamps / ids from either side when the chosen text wins."""
+    return Message(
+        author=(
+            winner.author
+            if winner.author not in ("", "unknown")
+            else other.author
+        ),
+        text=winner.text,
+        message_id=winner.message_id
+        if winner.message_id is not None
+        else other.message_id,
+        content_type=winner.content_type or other.content_type,
+        creation_time_us=winner.creation_time_us
+        if winner.creation_time_us is not None
+        else other.creation_time_us,
+        attachments=winner.attachments or other.attachments,
+        source=winner.source
+        if winner.source != "unknown"
+        else other.source,
+    )
+
+
 def _prefer_message(a: Message, b: Message) -> Message:
     """Prefer network JSON over DOM, then richer / better-labeled copies."""
     a_net = 1 if a.source == "network" else 0
@@ -216,18 +262,24 @@ def _prefer_message(a: Message, b: Message) -> Message:
         # Network text wins unless it's dramatically shorter/truncated
         winner, loser = (a, b) if a_net else (b, a)
         if len(winner.text or "") + 80 >= len(loser.text or ""):
-            return winner
+            return _merge_metadata(winner, loser)
+        # DOM was much longer — keep DOM text but preserve network metadata
+        return _merge_metadata(loser, winner)
     a_code = (a.text or "").count("```")
     b_code = (b.text or "").count("```")
     if a_code != b_code:
-        return a if a_code > b_code else b
+        return _merge_metadata(*( (a, b) if a_code > b_code else (b, a) ))
     if abs(len(a.text or "") - len(b.text or "")) > 40:
-        return a if len(a.text or "") >= len(b.text or "") else b
+        return _merge_metadata(
+            *((a, b) if len(a.text or "") >= len(b.text or "") else (b, a))
+        )
     a_score = (0 if a.author == "unknown" else 1) + (1 if a.creation_time_us else 0)
     b_score = (0 if b.author == "unknown" else 1) + (1 if b.creation_time_us else 0)
     if a_score != b_score:
-        return a if a_score > b_score else b
-    return a if len(a.text or "") >= len(b.text or "") else b
+        return _merge_metadata(*( (a, b) if a_score > b_score else (b, a) ))
+    return _merge_metadata(
+        *((a, b) if len(a.text or "") >= len(b.text or "") else (b, a))
+    )
 
 
 def _dedupe_messages(messages: list[Message]) -> list[Message]:
@@ -754,6 +806,15 @@ def list_chats(client: PoeClient, limit: int | None = None) -> list[Chat]:
                 or node.get("defaultBotNickname")
                 or ""
             )
+            activity = _node_time_us(node)
+            # Some list payloads nest the latest message time
+            if activity is None:
+                for nested_key in ("lastMessage", "newestMessage", "latestMessage"):
+                    nested = node.get(nested_key)
+                    if isinstance(nested, dict):
+                        activity = _node_time_us(nested)
+                        if activity is not None:
+                            break
             chats.append(
                 Chat(
                     chat_id=node.get("chatId"),
@@ -766,6 +827,7 @@ def list_chats(client: PoeClient, limit: int | None = None) -> list[Chat]:
                         or "unknown"
                     ),
                     bot_handle=str(handle or ""),
+                    activity_time_us=activity,
                 )
             )
             if limit is not None and len(chats) >= limit:

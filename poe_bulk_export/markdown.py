@@ -132,6 +132,7 @@ def write_markdown(
         bot=chat.bot,
         messages=chat.messages,
         chat_code=chat.chat_code,
+        fallback_time_us=chat.activity_time_us,
     )
     path = unique_path(output_dir, stem, ".md")
     path.write_text(

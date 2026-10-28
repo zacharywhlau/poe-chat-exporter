@@ -1,5 +1,10 @@
+from poe_bulk_export.client import _merge_metadata, _prefer_message
 from poe_bulk_export.models import Chat, Message
-from poe_bulk_export.util import chat_export_stem, earliest_message_date
+from poe_bulk_export.util import (
+    chat_export_stem,
+    coerce_poe_time_us,
+    earliest_message_date,
+)
 
 
 def test_earliest_message_date():
@@ -9,6 +14,33 @@ def test_earliest_message_date():
     ]
     assert earliest_message_date(messages) == "2024-01-15"
     assert earliest_message_date([]) == "undated"
+    assert (
+        earliest_message_date([], fallback_time_us=1705312200000000) == "2024-01-15"
+    )
+
+
+def test_coerce_ms_and_seconds():
+    assert coerce_poe_time_us(1705312200) == 1705312200000000
+    assert coerce_poe_time_us(1705312200000) == 1705312200000000
+    assert coerce_poe_time_us(1705312200000000) == 1705312200000000
+
+
+def test_prefer_keeps_network_timestamp_when_dom_text_wins():
+    network = Message(
+        author="human",
+        text="short",
+        creation_time_us=1705312200000000,
+        source="network",
+    )
+    dom = Message(
+        author="unknown",
+        text="short but much longer scraped copy from the DOM pane",
+        source="dom",
+    )
+    merged = _prefer_message(network, dom)
+    assert merged.creation_time_us == 1705312200000000
+    assert "longer scraped" in merged.text
+
 
 
 def test_chat_export_stem_order():
