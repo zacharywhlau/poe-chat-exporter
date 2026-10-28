@@ -2,6 +2,7 @@
 poe_exports/
 poe_debug/
 check/
+manual-export-chat/
 poe-chat-export-*.md
 .env
 *.cookie
