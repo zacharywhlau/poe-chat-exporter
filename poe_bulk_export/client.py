@@ -425,11 +425,135 @@ def _collapse_duplicate_turns(messages: list[Message]) -> list[Message]:
     return _dedupe_messages(messages)
 
 
+def _message_fingerprint(text: str) -> str:
+    return _normalize_for_dedupe(text)[:280]
+
+
+def _merge_dom_windows(windows: list[list[Message]]) -> list[Message]:
+    """Merge virtualized DOM scrapes into one timeline.
+
+    Poe recycles message nodes while scrolling: a bottom scrape has the newest
+    turns, a top scrape has the oldest. Replacing with the longest window drops
+    whichever end scrolled out of view — bad after you continue a long chat.
+    """
+    usable = [
+        [m for m in w if m.text and not _looks_like_ui_chrome(m.text)]
+        for w in windows
+        if w
+    ]
+    usable = [w for w in usable if w]
+    if not usable:
+        return []
+    if len(usable) == 1:
+        return list(usable[0])
+
+    def _find_match(msg: Message, pool: list[Message]) -> int:
+        fp = _message_fingerprint(msg.text)
+        if not fp:
+            return -1
+        for i, prev in enumerate(pool):
+            if not _same_speaker(prev.author, msg.author):
+                continue
+            if (
+                _message_fingerprint(prev.text) == fp
+                or _overlap_score(prev.text, msg.text) >= 0.5
+            ):
+                return i
+        return -1
+
+    # windows[0] ≈ initial bottom (newest); later ≈ after scrolling up (older).
+    # Walk oldest → newest: keep the oldest window, then append only the
+    # suffix of each newer window that comes after the overlap.
+    ordered = list(reversed(usable))
+    result: list[Message] = list(ordered[0])
+
+    for window in ordered[1:]:
+        last_match_in_window = -1
+        for i, msg in enumerate(window):
+            idx = _find_match(msg, result)
+            if idx >= 0:
+                result[idx] = _prefer_message(result[idx], msg)
+                last_match_in_window = i
+        for msg in window[last_match_in_window + 1 :]:
+            if _find_match(msg, result) >= 0:
+                continue
+            result.append(msg)
+    return result
+
+
+def _insert_message_by_time(result: list[Message], msg: Message) -> None:
+    """Insert msg into result using timestamps when possible."""
+    t = msg.creation_time_us
+    if t is None:
+        # Opening human prompt often lacks a stamp while the bot reply has one.
+        if _speaker_side(msg.author) == "human" and result:
+            if _speaker_side(result[0].author) == "bot":
+                result.insert(0, msg)
+                return
+        result.append(msg)
+        return
+    for i, existing in enumerate(result):
+        et = existing.creation_time_us
+        if et is not None and et > t:
+            result.insert(i, msg)
+            return
+    result.append(msg)
+
+
 def _assemble_from_dom_and_network(
     dom_msgs: list[Message],
     network_msgs: list[Message],
 ) -> list[Message]:
-    """DOM document order drives turns; network upgrades text/metadata."""
+    """Merge DOM + network. Prefer timed network order for multi-turn chats."""
+    dom_msgs = [
+        m for m in dom_msgs if m.text and not _looks_like_ui_chrome(m.text)
+    ]
+    network_msgs = _dedupe_messages(
+        [m for m in network_msgs if m.text and not _looks_like_ui_chrome(m.text)]
+    )
+    timed_net = [m for m in network_msgs if m.creation_time_us]
+
+    # Timed network history is the best backbone once a chat has several turns
+    # (continuing a thread often virtualizes the original prompt out of the DOM).
+    if len(timed_net) >= 2 and len(timed_net) >= max(2, len(dom_msgs) - 1):
+        backbone = _sort_messages(list(timed_net))
+        unused_dom = list(dom_msgs)
+        result: list[Message] = []
+        for net in backbone:
+            best_i = -1
+            best_score = 0.0
+            for i, dom in enumerate(unused_dom):
+                if not _same_speaker(dom.author, net.author):
+                    continue
+                score = _overlap_score(dom.text, net.text)
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+            if best_i >= 0 and best_score >= 0.5:
+                dom = unused_dom.pop(best_i)
+                result.append(_prefer_message(net, dom))
+            else:
+                result.append(net)
+        for dom in unused_dom:
+            if any(
+                _same_speaker(dom.author, r.author)
+                and _overlap_score(dom.text, r.text) >= 0.5
+                for r in result
+            ):
+                continue
+            _insert_message_by_time(result, dom)
+        for net in network_msgs:
+            if net.creation_time_us:
+                continue
+            if any(
+                _same_speaker(net.author, r.author)
+                and _overlap_score(net.text, r.text) >= 0.5
+                for r in result
+            ):
+                continue
+            _insert_message_by_time(result, net)
+        return result
+
     if not dom_msgs:
         messages = list(network_msgs)
         if any(m.creation_time_us for m in messages):
@@ -437,11 +561,8 @@ def _assemble_from_dom_and_network(
         return messages
 
     unused = list(network_msgs)
-    result: list[Message] = []
-
+    result = []
     for dom in dom_msgs:
-        if _looks_like_ui_chrome(dom.text):
-            continue
         best_i = -1
         best_score = 0.0
         for i, net in enumerate(unused):
@@ -451,25 +572,20 @@ def _assemble_from_dom_and_network(
             if score > best_score:
                 best_score = score
                 best_i = i
-        if best_i >= 0 and best_score >= 0.55:
+        if best_i >= 0 and best_score >= 0.5:
             net = unused.pop(best_i)
             result.append(_prefer_message(net, dom))
         else:
             result.append(dom)
 
-    leftovers = unused
-    if any(m.creation_time_us for m in leftovers):
-        leftovers = _sort_messages(list(leftovers))
-    for net in leftovers:
-        if _looks_like_ui_chrome(net.text):
-            continue
+    for net in unused:
         if any(
             _same_speaker(net.author, r.author)
-            and _overlap_score(net.text, r.text) >= 0.55
+            and _overlap_score(net.text, r.text) >= 0.5
             for r in result
         ):
             continue
-        result.append(net)
+        _insert_message_by_time(result, net)
 
     return result
 
@@ -830,9 +946,9 @@ class PoeClient:
         scroll_pages: int = 25,
         include_thinking: bool = False,
     ) -> list[Message]:
-        """Open the chat page; DOM order drives turns, network upgrades text."""
+        """Open the chat page; merge scrolled DOM windows + network JSON."""
         network_by_key: dict[Any, Message] = {}
-        dom_ordered: list[Message] = []
+        dom_windows: list[list[Message]] = []
         api_hits = 0
         network_count = 0
 
@@ -873,12 +989,11 @@ class PoeClient:
                 print(f"  landed on {self.page.url}", file=sys.stderr)
                 opened = True
 
-                # DOM document order is the turn sequence; network upgrades
-                # markdown quality (fences) later in assemble.
+                # Capture the newest-end window first (bottom of chat).
                 dom_msgs, page_info = self._scrape_dom_messages()
                 if dom_msgs:
-                    dom_ordered = dom_msgs
-                if network_by_key or dom_ordered:
+                    dom_windows.append(dom_msgs)
+                if network_by_key or dom_windows:
                     break
                 if api_hits > 0:
                     break
@@ -887,34 +1002,43 @@ class PoeClient:
                 print("Could not open any chat URL", file=sys.stderr)
                 return []
 
+            stable_rounds = 0
             for i in range(scroll_pages):
                 before_net = len(network_by_key)
-                before_dom = len(dom_ordered)
+                before_merged = len(_merge_dom_windows(dom_windows))
                 before_nodes = network_count
                 self._scroll_chat_up()
                 self.page.wait_for_timeout(1200)
                 dom_msgs, page_info = self._scrape_dom_messages()
-                # Prefer the scrape with the most bubbles (older history loaded)
-                if len(dom_msgs) >= len(dom_ordered):
-                    dom_ordered = dom_msgs
+                if dom_msgs:
+                    dom_windows.append(dom_msgs)
+                merged_count = len(_merge_dom_windows(dom_windows))
                 if (
                     len(network_by_key) == before_net
-                    and len(dom_ordered) == before_dom
+                    and merged_count == before_merged
                     and network_count == before_nodes
                 ):
                     self.page.wait_for_timeout(1500)
                     dom_msgs, page_info = self._scrape_dom_messages()
-                    if len(dom_msgs) >= len(dom_ordered):
-                        dom_ordered = dom_msgs
+                    if dom_msgs:
+                        dom_windows.append(dom_msgs)
+                    merged_count = len(_merge_dom_windows(dom_windows))
                     if (
                         len(network_by_key) == before_net
-                        and len(dom_ordered) == before_dom
-                        and i > 2
+                        and merged_count == before_merged
                     ):
-                        break
+                        stable_rounds += 1
+                        if stable_rounds >= 2 and i > 2:
+                            break
+                    else:
+                        stable_rounds = 0
+                else:
+                    stable_rounds = 0
 
+            dom_ordered = _merge_dom_windows(dom_windows)
             print(
-                f"Harvested network={len(network_by_key)} dom={len(dom_ordered)} "
+                f"Harvested network={len(network_by_key)} "
+                f"dom={len(dom_ordered)} windows={len(dom_windows)} "
                 f"(api responses={api_hits}, network_nodes={network_count}, "
                 f"dom_scrape={page_info.get('messageCount', 0)}) "
                 f"at {self.page.url}",
@@ -1066,38 +1190,11 @@ def fetch_messages(
     *,
     include_thinking: bool = False,
 ) -> list[Message]:
-    """Prefer browser chat-page harvest; GraphQL is fallback / later-chat speedup."""
-    if client._graphql_messages_ok:
-        try:
-            return _fetch_messages_graphql(
-                client, chat, include_thinking=include_thinking
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"GraphQL message fetch failed, falling back to page harvest: {exc}",
-                file=sys.stderr,
-            )
-
+    """Always prefer page harvest; GraphQL only if the page yields nothing."""
     messages = client.harvest_chat_messages(
         chat, include_thinking=include_thinking
     )
     if messages:
-        # Probe GraphQL for later chats, but never replace this chat's harvest —
-        # GraphQL often returns plain + markdown duplicates of the same bot turn.
-        if not client._graphql_messages_ok:
-            try:
-                gql_msgs = _fetch_messages_graphql(
-                    client, chat, include_thinking=include_thinking
-                )
-                if gql_msgs:
-                    client._graphql_messages_ok = True
-                    print(
-                        "GraphQL message fetch OK — will try it for remaining chats "
-                        "(keeping page harvest for this chat)",
-                        file=sys.stderr,
-                    )
-            except Exception:
-                pass
         return messages
 
     try:

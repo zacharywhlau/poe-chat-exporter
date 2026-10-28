@@ -4,6 +4,7 @@ from poe_bulk_export.client import (
     _collapse_duplicate_turns,
     _dedupe_messages,
     _looks_like_ui_chrome,
+    _merge_dom_windows,
     _normalize_for_dedupe,
     _overlap_score,
     _walk_message_nodes,
@@ -168,6 +169,93 @@ def test_assemble_workflow_guide_order_and_fences():
     assert messages[1].text.count("```bash") >= 1
     # No duplicate bot answer
     assert sum(1 for m in messages if m.author == "bot") == 1
+
+
+def test_merge_dom_windows_keeps_both_ends_of_virtualized_chat():
+    """Bottom scrape has newest turns; top scrape has the opening prompt."""
+    prompt = "Draft git and GitHub workflow for teamwork developing python projects"
+    guide = (
+        "Git & GitHub Team Workflow for Python Projects\n\n"
+        "1. Purpose and Scope\n\n"
+        "This document defines how our team uses Git and GitHub.\n" + ("more " * 80)
+    )
+    recap_q = "recap"
+    recap_a = (
+        "# Recap: Git & GitHub Team Workflow\n\n"
+        "**The workflow:** GitHub Flow — main stays stable.\n"
+    )
+    bottom = [
+        Message(author="bot", text=guide, source="dom"),
+        Message(author="human", text=recap_q, source="dom"),
+        Message(author="bot", text=recap_a, source="dom"),
+    ]
+    top = [
+        Message(author="human", text=prompt, source="dom"),
+        Message(author="bot", text=guide, source="dom"),
+    ]
+    merged = _merge_dom_windows([bottom, top])
+    assert len(merged) == 4
+    assert merged[0].author == "human"
+    assert "Draft git" in merged[0].text
+    assert merged[2].text == "recap"
+    assert "Recap" in merged[3].text
+
+
+def test_assemble_continued_chat_uses_timed_network_backbone():
+    """After a follow-up, DOM may miss the opening prompt; network still has it."""
+    prompt = "Draft git and GitHub workflow for teamwork developing python projects"
+    guide = (
+        "# Git & GitHub Team Workflow for Python Projects\n\n"
+        "## 1. Purpose and Scope\n\n"
+        "This document defines how our team uses Git and GitHub.\n"
+        + ("detail " * 100)
+    )
+    recap_a = "# Recap\n\n**The workflow:** GitHub Flow.\n"
+    # Incomplete DOM like export -4 (bot guide, you recap, bot recap)
+    dom = [
+        Message(author="bot", text=guide.replace("# ", "").replace("## ", ""), source="dom"),
+        Message(author="human", text="recap", source="dom"),
+        Message(author="bot", text=recap_a, source="dom"),
+    ]
+    network = [
+        Message(
+            author="human",
+            text=prompt,
+            message_id=1,
+            creation_time_us=100,
+            source="network",
+        ),
+        Message(
+            author="bot",
+            text=guide,
+            message_id=2,
+            creation_time_us=200,
+            source="network",
+        ),
+        Message(
+            author="human",
+            text="recap",
+            message_id=3,
+            creation_time_us=300,
+            source="network",
+        ),
+        Message(
+            author="bot",
+            text=recap_a,
+            message_id=4,
+            creation_time_us=400,
+            source="network",
+        ),
+    ]
+    assembled = _assemble_from_dom_and_network(dom, network)
+    messages = cleanup_messages(
+        _dedupe_messages(assembled), bot_name="Claude-Fable-5"
+    )
+    assert len(messages) == 4
+    assert messages[0].author == "human"
+    assert "Draft git" in messages[0].text
+    assert messages[2].text.strip() == "recap"
+    assert "Recap" in messages[3].text
 
 
 def test_collapse_plain_and_markdown_bot_duplicates():
