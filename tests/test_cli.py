@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 
 from helpers import GOLDEN_CODE, GOLDEN_REFERENCE, load_json
@@ -95,6 +96,19 @@ def test_incremental_skips_unchanged_complete_chats(tmp_path, monkeypatch):
     assert second.exit_code == 0, second.output
     assert calls == [GOLDEN_CODE]
     assert "skipped 1 unchanged" in second.output
+
+    # A different thinking choice changes the output, so the chat is exported again.
+    third = runner.invoke(cli.app, [*args, "--strip-thinking"])
+    assert third.exit_code == 0, third.output
+    assert calls == [GOLDEN_CODE, GOLDEN_CODE]
+
+    # Entries written before the thinking choice was recorded are exported again once.
+    index = json.loads((tmp_path / INDEX_FILE).read_text(encoding="utf-8"))
+    del index["chats"][GOLDEN_CODE]["strip_thinking"]
+    (tmp_path / INDEX_FILE).write_text(json.dumps(index), encoding="utf-8")
+    runner.invoke(cli.app, [*args, "--strip-thinking"])
+    runner.invoke(cli.app, [*args, "--strip-thinking"])
+    assert calls == [GOLDEN_CODE] * 3
 
 
 def test_logged_out_session_exits_with_code_2(tmp_path, monkeypatch):

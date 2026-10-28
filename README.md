@@ -2,7 +2,7 @@
 
 Export your [Poe.com](https://poe.com) conversations to Markdown (and optionally JSON) from the command line: every chat in one run, or specific chats by code.
 
-The exporter reads the raw message data Poe ships with each chat page: the same Markdown that [`@export-chat`](https://poe.com/export-chat) prints. Code blocks, headings and lists come through exactly as the bot wrote them, and `--style export-chat` produces a file byte-for-byte identical to `@export-chat`'s.
+The exporter reads the raw message data Poe ships with each chat page: the same Markdown that [`@export-chat`](https://poe.com/export-chat) prints. Code blocks, headings and lists come through exactly as the bot wrote them, and `--style export-chat --strip-thinking` produces a file byte-for-byte identical to `@export-chat`'s.
 
 ## Requirements
 
@@ -58,8 +58,8 @@ poe-bulk-export export -c https://poe.com/chat/abc123xyz -c def456uvw
 # Same layout as Poe's @export-chat
 poe-bulk-export export --style export-chat
 
-# Markdown and JSON, keep "Thinking..." blocks, save images/files locally
-poe-bulk-export export -f both --include-thinking --download-attachments
+# Markdown and JSON, drop "Thinking..." blocks, save images/files locally
+poe-bulk-export export -f both --strip-thinking --download-attachments
 
 # Later runs: only re-export chats that changed since their last complete export
 poe-bulk-export export --incremental
@@ -70,9 +70,9 @@ poe-bulk-export export --incremental
 | `-c, --chat-code` | Export only these chats (code or URL, repeatable). Skips the chat-list scan. |
 | `-f, --format` | `markdown` (default), `json` or `both`. |
 | `--style` | `archive` (default) or `export-chat`. See [Output](#output). |
-| `--include-thinking` | Keep the leading `*Thinking...*` reasoning block some bots add (stripped by default). |
+| `--strip-thinking` | Remove the leading `*Thinking...*` reasoning block some bots write before their answer. By default it is kept, as in Poe. |
 | `-o, --output` | Output directory (default `poe_exports`). |
-| `--incremental` | Skip chats that are unchanged and were exported completely before. |
+| `--incremental` | Skip chats that are unchanged and were exported completely before with the same `--format`, `--style` and thinking choice. |
 | `--download-attachments` | Save real media under `attachments/<chat_code>/` and link the local copies. |
 | `-l, --limit` | Export at most N chats from the list. |
 | `--max-pages` | Upper bound on pages of older messages loaded per chat (default 200). |
@@ -92,7 +92,7 @@ Done: exported 1/1 -> poe_exports/
 
 ### Styles
 
-**`export-chat`**: identical to Poe's `@export-chat`. Each turn is `User:` or `<Bot name>:`, a blank line, then the message's raw Markdown. Turns are separated by `---`. There is no header and no trailing newline, matching Poe's file.
+**`export-chat`**: the layout of Poe's `@export-chat`. Each turn is `User:` or `<Bot name>:`, a blank line, then the message's raw Markdown. Turns are separated by `---`. There is no header and no trailing newline, matching Poe's file. Each bot reply is labelled with the bot that wrote it, so a reply from `@export-chat` or another mentioned bot shows that bot's name. `@export-chat` itself leaves out `*Thinking...*` blocks; add `--strip-thinking` to do the same.
 
 ```markdown
 User:
@@ -155,11 +155,11 @@ Claude-Sonnet-4.5:
 ### Checking an export against `@export-chat`
 
 ```bash
-poe-bulk-export export --chat-code abc123xyz --style export-chat -o check
-diff check/*__abc123xyz.md poe-chat-export-<timestamp>.md
+poe-bulk-export export --chat-code abc123xyz --style export-chat --strip-thinking -o check
+cmp poe-chat-export-<timestamp>.md check/*__abc123xyz.md
 ```
 
-`diff` prints nothing when the two files are identical.
+`cmp` prints nothing when the two files are identical. If the chat continued after `@export-chat` ran (the `@export-chat` request and its reply are part of the chat too), the export is longer, and `cmp` reports `EOF on poe-chat-export-<timestamp>.md`: everything up to that point matched.
 
 ## How it works
 
@@ -172,7 +172,7 @@ diff check/*__abc123xyz.md poe-chat-export-<timestamp>.md
 
    Only messages on this chat's own message connection are taken, so previews of other chats in the sidebar cannot leak in.
 4. While the connection reports older messages (`hasPreviousPage`), the message list is scrolled to the top so Poe loads them itself. If scrolling stalls, older pages are requested directly with a signed `ChatListPaginationQuery`. A chat whose history still is not complete is exported with `complete: false` and a warning.
-5. Messages from all sources are merged by message id and ordered by creation time. Text is not edited, except for removing a leading `*Thinking...*` header plus its `>` quote block when an answer follows (unless `--include-thinking` is set).
+5. Messages from all sources are merged by message id and ordered by creation time. Text is not edited. The only exception is `--strip-thinking`, which removes a leading `*Thinking...*` header plus its `>` quote block from every turn not written by you, and only when an answer follows.
 6. Only when a page has no raw message data at all is the rendered HTML converted to Markdown (with `markdownify`). Those exports are marked `source: "dom-fallback"` and reported as warnings.
 
 GraphQL persisted-query hashes live in [`poe_bulk_export/gql_hashes.py`](poe_bulk_export/gql_hashes.py); hashes seen in live traffic take precedence.

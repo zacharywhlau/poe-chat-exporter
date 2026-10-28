@@ -160,7 +160,7 @@ def _export_one(
         raise RuntimeError("; ".join(result.notes) or "no messages found")
 
     apply_chat_info(chat, result.chat, result)
-    chat.messages = cleanup_messages(result.messages, include_thinking=include_thinking)
+    chat.messages = cleanup_messages(result.messages, strip_thinking=not include_thinking)
     chat.complete = result.complete
     chat.source = result.source
 
@@ -194,12 +194,12 @@ def export_cmd(
     style: MarkdownStyle = typer.Option(
         MarkdownStyle.archive,
         "--style",
-        help="Markdown layout: archive (front matter + transcript) or export-chat (exactly like @export-chat).",
+        help="Markdown layout: archive (front matter + transcript) or export-chat (@export-chat's layout).",
     ),
     include_thinking: bool = typer.Option(
-        False,
-        "--include-thinking/--no-include-thinking",
-        help="Keep the '*Thinking...*' reasoning block some bots prepend (default: strip it).",
+        True,
+        "--include-thinking/--strip-thinking",
+        help="Keep (default) or remove the leading '*Thinking...*' reasoning block some bots write before their answer.",
     ),
     output: Path = typer.Option(Path("poe_exports"), "--output", "-o", help="Output directory."),
     download_attachments: bool = typer.Option(
@@ -243,7 +243,9 @@ def export_cmd(
             total = len(chats)
 
             for chat in tqdm(chats, desc="Exporting", unit="chat", file=sys.stderr, disable=total < 2):
-                if incremental and index.is_current(chat, style=style.value, fmt=format.value):
+                if incremental and index.is_current(
+                    chat, style=style.value, fmt=format.value, strip_thinking=not include_thinking
+                ):
                     skipped += 1
                     if verbose:
                         tqdm.write(f"SKIP {_chat_label(chat)}: unchanged", file=sys.stderr)
@@ -269,7 +271,9 @@ def export_cmd(
                     continue
 
                 exported += 1
-                index.record(chat, paths, style=style.value, fmt=format.value)
+                index.record(
+                    chat, paths, style=style.value, fmt=format.value, strip_thinking=not include_thinking
+                )
                 index.save()
                 degraded = result.complete is not True or result.source != "raw"
                 if degraded:

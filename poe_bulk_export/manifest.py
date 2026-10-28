@@ -1,9 +1,10 @@
 """``.poe-export-index.json``: what was exported, so ``--incremental`` can skip it.
 
-A chat is skipped only when its last export was complete, used the same style
-and format, its files still exist, and the chat list reports the same
-last-activity marker as before. Chats without such a marker are always
-re-exported.
+A chat is skipped only when its last export was complete, used the same style,
+format and thinking choice, its files still exist, and the chat list reports
+the same last-activity marker as before. Chats without such a marker are always
+re-exported, and so are entries from versions that did not record the thinking
+choice.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ class ExportIndex:
         chats = data.get("chats") if isinstance(data, dict) else None
         return cls(output_dir, chats if isinstance(chats, dict) else {})
 
-    def is_current(self, chat: Chat, *, style: str, fmt: str) -> bool:
+    def is_current(self, chat: Chat, *, style: str, fmt: str, strip_thinking: bool = False) -> bool:
         entry = self.chats.get(chat.chat_code)
         if not entry or not chat.activity_signature:
             return False
@@ -48,10 +49,14 @@ class ExportIndex:
             return False
         if entry.get("style") != style or entry.get("format") != fmt:
             return False
+        if entry.get("strip_thinking") is not strip_thinking:
+            return False
         files = entry.get("files") or []
         return bool(files) and all((self.output_dir / name).is_file() for name in files)
 
-    def record(self, chat: Chat, files: list[Path], *, style: str, fmt: str) -> None:
+    def record(
+        self, chat: Chat, files: list[Path], *, style: str, fmt: str, strip_thinking: bool = False
+    ) -> None:
         last = chat.messages[-1] if chat.messages else None
         names = []
         for path in files:
@@ -64,6 +69,7 @@ class ExportIndex:
             "files": names,
             "style": style,
             "format": fmt,
+            "strip_thinking": strip_thinking,
             "complete": chat.complete is True,
             "source": chat.source,
             "message_count": len(chat.messages),

@@ -19,7 +19,7 @@ def load_json(name: str) -> Any:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
-def golden_chat() -> Chat:
+def golden_chat(*, strip_thinking: bool = False) -> Chat:
     """The 4-turn workflow-guide chat, built from its Relay store records."""
     extraction = extract_from_relay_records(
         load_json("workflow_guide_store.json"), ChatTarget(chat_code=GOLDEN_CODE)
@@ -32,7 +32,7 @@ def golden_chat() -> Chat:
         title=info.title or "Untitled",
         bot=info.bot_name or "",
         bot_handle=info.bot_handle or "",
-        messages=cleanup_messages(extraction.messages),
+        messages=cleanup_messages(extraction.messages, strip_thinking=strip_thinking),
         complete=extraction.page_info.has_more is False,
         source="raw",
     )
