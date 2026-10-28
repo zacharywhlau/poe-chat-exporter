@@ -232,6 +232,6 @@ POE_LIVE=1 pytest tests/test_live_share.py   # also harvest a public Poe share p
 ruff check .
 ```
 
-The golden test renders recorded store records for a real four-turn chat and compares the result byte-for-byte with that chat's `@export-chat` file (`tests/fixtures/workflow_guide_export_chat.md`). The other fixtures are trimmed page data from a public share page.
+The golden test uses a real chat's six messages as Relay store records, in the shape Poe's private chat page uses (`tests/fixtures/workflow_guide_store.json`; ids, times and the user record are placeholders). The chat holds a prompt, an answer with a `*Thinking...*` block, a follow-up and its answer, then `@export-chat` and its reply. With `--strip-thinking`, the export must start with that chat's `@export-chat` file byte for byte (`tests/fixtures/workflow_guide_export_chat.md`), followed by the `@export-chat` request and reply as normal turns. By default, the thinking block is kept and every turn is labelled with its own speaker. The other fixtures are trimmed page data from a public share page.
 
 Inspired by community exporters such as [ericblue/poe-chat-exporter](https://github.com/ericblue/poe-chat-exporter).

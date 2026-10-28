@@ -3,13 +3,20 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 
-from helpers import GOLDEN_CODE, GOLDEN_REFERENCE, load_json
+from helpers import (
+    GOLDEN_CODE,
+    GOLDEN_FILE_NAME,
+    golden_chat,
+    golden_stripped_export,
+    load_json,
+)
 from typer.testing import CliRunner
 
 from poe_bulk_export import cli
 from poe_bulk_export.client import HarvestResult, NotLoggedInError
 from poe_bulk_export.extract import ChatInfo, ChatTarget, extract_from_relay_records
 from poe_bulk_export.manifest import INDEX_FILE
+from poe_bulk_export.markdown import render_export_chat
 from poe_bulk_export.models import Chat
 
 runner = CliRunner()
@@ -40,7 +47,7 @@ def fake_harvest(calls: list[str], records: dict | None = None):
         )
         return HarvestResult(
             messages=ex.messages, complete=True, source="raw",
-            counts={"store": 4, "next_data": 2, "network": 0}, chat=ex.chat, url=url, elapsed_s=1.5,
+            counts={"store": 6, "next_data": 3, "network": 3}, chat=ex.chat, url=url, elapsed_s=1.5,
         )
 
     return harvest
@@ -64,17 +71,22 @@ def test_direct_chat_code_export_with_failure_summary(tmp_path, monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert calls == [GOLDEN_CODE, "missingchat"]
-    expected_name = f"2026-10-28_Claude-Fable-5_Python_GitHub_Workflow_Guide__{GOLDEN_CODE}.md"
-    assert _md_files(tmp_path) == [expected_name]
-    assert (tmp_path / expected_name).read_bytes() == GOLDEN_REFERENCE.read_bytes()
-    assert "OK   Python GitHub Workflow Guide [91z1xrschrxyu24wqx]: 4 messages (store=4, next_data=2), complete" in result.output
+    assert _md_files(tmp_path) == [GOLDEN_FILE_NAME]
+    written = (tmp_path / GOLDEN_FILE_NAME).read_text(encoding="utf-8")
+    assert written == render_export_chat(golden_chat())
+    assert "\n\nClaude-Fable-5:\n\n*Thinking...*\n\n> I need to create" in written
+    assert (
+        "OK   Python GitHub Workflow Guide [91z1xrschrxyu24wqx]: "
+        "6 messages (store=6, next_data=3, network=3), complete"
+    ) in result.output
     assert "Failed:" in result.output and "missingchat" in result.output
     assert "Done: exported 1/2, 1 failed" in result.output
 
     # Exporting again replaces the file instead of adding a "-2" copy.
-    result = runner.invoke(cli.app, args[:-2])
+    result = runner.invoke(cli.app, [*args[:-2], "--strip-thinking"])
     assert result.exit_code == 0, result.output
-    assert _md_files(tmp_path) == [expected_name]
+    assert _md_files(tmp_path) == [GOLDEN_FILE_NAME]
+    assert (tmp_path / GOLDEN_FILE_NAME).read_bytes() == golden_stripped_export().encode("utf-8")
     assert (tmp_path / INDEX_FILE).is_file()
 
 
@@ -83,7 +95,7 @@ def test_incremental_skips_unchanged_complete_chats(tmp_path, monkeypatch):
     listed = Chat(
         chat_id=1481885248, chat_code=GOLDEN_CODE, node_id="Q2hhdDoxNDgxODg1MjQ4",
         title="Python GitHub Workflow Guide", bot="Claude-Fable-5",
-        activity_signature="lastInteractionTime=1793176803222222",
+        activity_signature="lastInteractionTime=1793176132443518",
     )
     monkeypatch.setattr(cli, "open_client", fake_open_client)
     monkeypatch.setattr(cli, "harvest_chat", fake_harvest(calls))
@@ -127,7 +139,7 @@ def test_unrecognised_authors_are_reported_as_a_warning(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert (
         "WARN Python GitHub Workflow Guide [91z1xrschrxyu24wqx]: "
-        "4 messages (store=4, next_data=2), complete, 4 messages with unknown author"
+        "6 messages (store=6, next_data=3, network=3), complete, 6 messages with unknown author"
     ) in result.output
     assert "Done: exported 1/1, 1 with warnings" in result.output
     assert "poe-bulk-export dump --chat-code CODE" in result.output

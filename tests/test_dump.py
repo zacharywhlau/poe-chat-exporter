@@ -1,9 +1,10 @@
 import json
 
-from helpers import GOLDEN_CODE, GOLDEN_REFERENCE, golden_chat
+from helpers import GOLDEN_CODE, golden_chat
 
 from poe_bulk_export.client import HarvestResult
 from poe_bulk_export.dump import REDACTED, redact, write_dump
+from poe_bulk_export.markdown import render_export_chat
 from poe_bulk_export.models import Chat
 
 
@@ -28,7 +29,7 @@ def test_write_dump_files(tmp_path):
         messages=chat.messages,
         complete=True,
         source="raw",
-        counts={"store": 4, "next_data": 2},
+        counts={"store": 6, "next_data": 3},
         chat=None,
         url=f"https://poe.com/chat/{GOLDEN_CODE}",
         raw={
@@ -47,9 +48,11 @@ def test_write_dump_files(tmp_path):
         "next_data.json", "store_records.json", "store_summary.json", "network/001-ChatListPaginationQuery.json",
         "dom.html", "export-chat.md", "messages.json", "summary.json",
     }
-    assert (tmp_path / "export-chat.md").read_bytes() == GOLDEN_REFERENCE.read_bytes()
+    rendered = (tmp_path / "export-chat.md").read_text(encoding="utf-8")
+    assert rendered == render_export_chat(golden_chat())
+    assert "*Thinking...*" in rendered
     everything = "".join(p.read_text(encoding="utf-8") for p in tmp_path.rglob("*") if p.is_file())
     assert "me@example.com" not in everything
     summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
-    assert summary["counts"] == {"store": 4, "next_data": 2}
+    assert summary["counts"] == {"store": 6, "next_data": 3}
     assert summary["complete"] is True

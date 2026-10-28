@@ -132,7 +132,7 @@ def test_sidebar_previews_of_other_chats_are_ignored():
 def test_golden_store_fixture_ignores_sidebar_chat():
     ex = extract_from_relay_records(load_json("workflow_guide_store.json"), ChatTarget(chat_code="91z1xrschrxyu24wqx"))
     assert ex.owners_seen == 2 and ex.owners_used == 1
-    assert len(ex.messages) == 4
+    assert len(ex.messages) == 6
     assert all("different conversation" not in m.text for m in ex.messages)
     # Handle connection (all loaded pages) wins over the raw first-page field.
     assert ex.page_info.has_previous_page is False
