@@ -13,7 +13,7 @@ while true; do
   echo "  2) Export every chat   (preferred: --style export-chat → poe_exports/)"
   echo "  3) Export changed only (incremental)"
   echo "  4) Export one chat by code/URL"
-  echo "  5) Setup / reinstall .venv"
+  echo "  5) Force reinstall .venv (optional; 1–4 already auto-setup)"
   echo "  q) Quit"
   echo
   read -r -p "Choose: " CHOICE
@@ -42,7 +42,10 @@ while true; do
       pause_at_end
       ;;
     5)
-      bash ./Setup.command
+      rm -rf "$REPO_ROOT/.venv"
+      ensure_install
+      _green "Reinstall done."
+      pause_at_end
       ;;
     q|Q)
       exit 0

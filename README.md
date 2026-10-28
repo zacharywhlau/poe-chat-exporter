@@ -21,7 +21,7 @@ playwright install chromium
 
 On a Mac, if you also use Anaconda, run `conda deactivate` first so `.venv`'s `python` wins (or call `.venv/bin/poe-bulk-export` directly). After moving the project folder (e.g. to iCloud), delete `.venv` and recreate it — old venvs break when their path changes.
 
-After `git pull`, run `pip install -e .` again so new dependencies and CLI options are picked up. On a Mac you can also double-click [`mac/Setup.command`](mac/Setup.command).
+After `git pull`, run `pip install -e .` again so new dependencies and CLI options are picked up. On a Mac the [`mac/`](#mac-helpers-double-click) helpers recreate `.venv` and install automatically when needed.
 
 ## Sign-in cookie
 
@@ -80,16 +80,21 @@ poe-bulk-export export --style export-chat -o poe_exports -f both --strip-thinki
 
 ### Mac helpers (double-click)
 
-The [`mac/`](mac/) folder has Finder-friendly `.command` scripts (the Mac equivalent of a `.bat` file). They `cd` to the project, use `.venv`, and load `.env` automatically:
+The [`mac/`](mac/) folder has Finder-friendly `.command` scripts (the Mac equivalent of a `.bat` file). Each common action:
+
+1. `cd`s to the project,
+2. creates/repairs `.venv` and installs the package + Chromium **if needed**,
+3. loads `.env`,
+4. runs the CLI.
 
 | Double-click | What it does |
 | --- | --- |
-| [`Setup.command`](mac/Setup.command) | Create `.venv`, install the package + Chromium, create `.env` from the example if missing |
 | [`List Chats.command`](mac/List%20Chats.command) | `poe-bulk-export list` |
 | [`Export All Chats.command`](mac/Export%20All%20Chats.command) | Preferred: `export --style export-chat -o poe_exports` |
 | [`Export Changed Only.command`](mac/Export%20Changed%20Only.command) | Same, with `--incremental` |
 | [`Export One Chat.command`](mac/Export%20One%20Chat.command) | Asks for a chat code/URL, then exports that chat |
 | [`Poe Tools.command`](mac/Poe%20Tools.command) | Small menu of the above |
+| [`Setup.command`](mac/Setup.command) | Optional: force a clean reinstall of `.venv` |
 
 After `git pull`, make them executable once if macOS complains:
 
@@ -97,7 +102,7 @@ After `git pull`, make them executable once if macOS complains:
 chmod +x mac/*.command mac/_lib.sh
 ```
 
-First time: run **Setup**, edit `.env` with your cookie, then use **Export All Chats** (or **Poe Tools**).
+First time only: if `.env` is missing, a helper creates it from `.env.example` and asks you to paste `POE_TOKEN`, then run again. After that, just double-click **Export All Chats** (or **Poe Tools**).
 
 | Option | Meaning |
 | --- | --- |
