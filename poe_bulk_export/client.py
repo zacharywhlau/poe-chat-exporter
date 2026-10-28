@@ -426,35 +426,117 @@ class PoeClient:
             # Scroll is best-effort; message harvest still uses network events.
             pass
 
+    def _scrape_dom_messages(self) -> tuple[list[Message], dict[str, Any]]:
+        """Read visible chat bubbles from the DOM (works even when gql harvest is empty)."""
+        info = self._safe_evaluate(
+            """() => {
+              const messages = [];
+              const seen = new Set();
+              const push = (author, text) => {
+                const t = (text || '').trim();
+                if (!t) return;
+                const key = author + '\\n' + t;
+                if (seen.has(key)) return;
+                seen.add(key);
+                messages.push({ author, text: t });
+              };
+
+              const containers = document.querySelectorAll(
+                '[class*="Markdown_markdownContainer"], [class*="Markdown_markdown"]'
+              );
+              for (const container of containers) {
+                let host = container;
+                for (let i = 0; i < 10 && host; i++) {
+                  const cls = String(host.className || '');
+                  if (/Message|Bubble|ChatMessage/i.test(cls)) break;
+                  host = host.parentElement;
+                }
+                host = host || container;
+                const cls = String(host.className || '');
+                let author = 'unknown';
+                if (/rightSide|RightSide|human|UserMessage|outbound/i.test(cls)) {
+                  author = 'human';
+                } else if (/leftSide|LeftSide|bot|BotMessage|inbound/i.test(cls)) {
+                  author = 'bot';
+                } else {
+                  // Position heuristic: user bubbles often align right
+                  const rect = host.getBoundingClientRect();
+                  const mid = window.innerWidth / 2;
+                  author = rect.left > mid * 0.9 ? 'human' : 'bot';
+                }
+                push(author, container.innerText || '');
+              }
+
+              if (messages.length === 0) {
+                // Broader fallback: any obvious message row text
+                const rows = document.querySelectorAll(
+                  '[class*="Message_row"], [class*="ChatMessage"], [data-testid*="message"]'
+                );
+                for (const row of rows) {
+                  const text = (row.innerText || '').trim();
+                  if (text) push('unknown', text);
+                }
+              }
+
+              const bodyText = (document.body && document.body.innerText) || '';
+              return {
+                title: document.title || '',
+                url: location.href,
+                messageCount: messages.length,
+                messages,
+                bodySample: bodyText.slice(0, 400),
+                looksLikeLogin: /log\\s*in|sign\\s*in|create account/i.test(bodyText.slice(0, 2000)),
+              };
+            }"""
+        ) or {}
+
+        messages = [
+            Message(
+                author=m.get("author") or "unknown",
+                text=m.get("text") or "",
+            )
+            for m in (info.get("messages") or [])
+            if m.get("text")
+        ]
+        return messages, info
+
+    def _merge_message(self, store: dict[Any, Message], msg: Message) -> None:
+        key: Any
+        if msg.message_id is not None:
+            key = ("id", msg.message_id)
+        else:
+            key = ("text", msg.author, (msg.text or "")[:240])
+        prev = store.get(key)
+        if prev is None or (len(msg.text or "") > len(prev.text or "")):
+            store[key] = msg
+
     def harvest_chat_messages(
         self,
         chat: Chat,
         *,
-        scroll_pages: int = 20,
+        scroll_pages: int = 25,
     ) -> list[Message]:
-        """Open the chat in the browser and collect messages from live gql traffic."""
-        by_id: dict[Any, Message] = {}
-        gql_hits = 0
+        """Open the chat page; collect messages from network JSON and the visible DOM."""
+        by_key: dict[Any, Message] = {}
+        api_hits = 0
 
         def on_response(response: Any) -> None:
-            nonlocal gql_hits
-            if "gql_POST" not in response.url:
+            nonlocal api_hits
+            url = response.url
+            if "poe.com" not in url:
                 return
-            gql_hits += 1
+            if not any(x in url for x in ("/api/", "gql", "graphql")):
+                return
+            api_hits += 1
             try:
                 data = response.json()
             except Exception:
                 return
             for node in _walk_message_nodes(data):
-                msg = _message_from_node(node)
-                key = (
-                    msg.message_id
-                    if msg.message_id is not None
-                    else (msg.author, msg.text[:80], msg.creation_time_us)
-                )
-                by_id[key] = msg
+                self._merge_message(by_key, _message_from_node(node))
 
         self.page.on("response", on_response)
+        page_info: dict[str, Any] = {}
         try:
             opened = False
             for url in _chat_urls(chat):
@@ -469,15 +551,17 @@ class PoeClient:
                     self.page.wait_for_load_state("load", timeout=20_000)
                 except Exception:
                     pass
-                # Extra settle time for client-side redirect + first gql payloads
-                self.page.wait_for_timeout(3000)
+                self.page.wait_for_timeout(3500)
                 self._wait_for_navigation_settle()
                 print(f"  landed on {self.page.url}", file=sys.stderr)
                 opened = True
-                if by_id:
+
+                dom_msgs, page_info = self._scrape_dom_messages()
+                for msg in dom_msgs:
+                    self._merge_message(by_key, msg)
+                if by_key:
                     break
-                # If we got gql traffic but no parseable messages, still try scrolling
-                if gql_hits > 0:
+                if api_hits > 0:
                     break
 
             if not opened:
@@ -485,23 +569,48 @@ class PoeClient:
                 return []
 
             for i in range(scroll_pages):
-                before = len(by_id)
+                before = len(by_key)
                 self._scroll_chat_up()
                 self.page.wait_for_timeout(1200)
-                if len(by_id) == before:
+                dom_msgs, page_info = self._scrape_dom_messages()
+                for msg in dom_msgs:
+                    self._merge_message(by_key, msg)
+                if len(by_key) == before:
                     self.page.wait_for_timeout(1500)
-                    if len(by_id) == before and i > 2:
+                    dom_msgs, page_info = self._scrape_dom_messages()
+                    for msg in dom_msgs:
+                        self._merge_message(by_key, msg)
+                    if len(by_key) == before and i > 2:
                         break
 
             print(
-                f"Harvested {len(by_id)} message(s) "
-                f"from {gql_hits} gql response(s) at {self.page.url}",
+                f"Harvested {len(by_key)} message(s) "
+                f"(api responses={api_hits}, dom={page_info.get('messageCount', 0)}) "
+                f"at {self.page.url}",
                 file=sys.stderr,
             )
+            if not by_key:
+                sample = (page_info.get("bodySample") or "").replace("\n", " ")[:200]
+                print(
+                    f"Page debug: title={page_info.get('title')!r} "
+                    f"login={page_info.get('looksLikeLogin')} sample={sample!r}",
+                    file=sys.stderr,
+                )
+                if page_info.get("looksLikeLogin"):
+                    print(
+                        "Chat page looks logged out. Re-copy p-b and also set "
+                        "POE_LAT from Cookies, then retry with --headed.",
+                        file=sys.stderr,
+                    )
         finally:
             self.page.remove_listener("response", on_response)
 
-        return _sort_messages(list(by_id.values()))
+        # DOM order is usually oldest→newest already; network msgs may need sort
+        messages = list(by_key.values())
+        if any(m.creation_time_us for m in messages):
+            return _sort_messages(messages)
+        # Preserve scrape order: human/bot turns as collected
+        return messages
 
 
 def list_chats(client: PoeClient, limit: int | None = None) -> list[Chat]:
