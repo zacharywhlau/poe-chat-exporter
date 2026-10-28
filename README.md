@@ -13,13 +13,15 @@ The exporter reads the raw message data Poe ships with each chat page: the same 
 ## Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python3 -m venv .venv                  # or: /opt/anaconda3/bin/python -m venv .venv
+source .venv/bin/activate              # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 playwright install chromium
 ```
 
-After `git pull`, run `pip install -e .` again so new dependencies and CLI options are picked up.
+On a Mac, if you also use Anaconda, run `conda deactivate` first so `.venv`'s `python` wins (or call `.venv/bin/poe-bulk-export` directly). After moving the project folder (e.g. to iCloud), delete `.venv` and recreate it — old venvs break when their path changes.
+
+After `git pull`, run `pip install -e .` again so new dependencies and CLI options are picked up. On a Mac you can also double-click [`mac/Setup.command`](mac/Setup.command).
 
 ## Sign-in cookie
 
@@ -27,43 +29,75 @@ After `git pull`, run `pip install -e .` again so new dependencies and CLI optio
 2. Open DevTools → **Application** → **Cookies** → `https://poe.com`.
 3. Copy the **`p-b`** value. If exports fail with `p-b` alone, also copy **`p-lat`**.
 
-The CLI reads `POE_TOKEN` / `POE_LAT` from the environment, or `--token` / `--lat`:
+Put them in a local `.env` (git-ignored — never commit real values):
 
 ```bash
-export POE_TOKEN='your_p-b_value'
-export POE_LAT='your_p-lat_value'      # optional
-
-# or keep them in .env (git-ignored) and load it into the shell:
 cp .env.example .env                   # then edit .env
-set -a; source .env; set +a
+# POE_TOKEN=your_p-b_cookie_value
+# POE_LAT=                                 # optional
 ```
 
-On Windows PowerShell: `$env:POE_TOKEN = 'your_p-b_value'`.
+Load once per terminal session, then run as many commands as you like in that same tab:
 
-Never commit real cookie values. When the cookie expires, the CLI stops with exit code 2 instead of writing empty exports.
+```bash
+set -a; source .env; set +a
+poe-bulk-export list
+```
+
+You do **not** need to re-run `source .env` before every command — only when you open a new terminal. The Mac helpers in [`mac/`](#mac-helpers-double-click) load `.env` for you.
+
+You can also pass `--token` / `--lat`, or export the variables yourself. On Windows PowerShell: `$env:POE_TOKEN = 'your_p-b_value'`.
+
+When the cookie expires, the CLI stops with exit code 2 instead of writing empty exports. Paste a fresh `p-b` into `.env`.
 
 ## Usage
+
+**Preferred export** (same layout as Poe's `@export-chat`, every chat, into `./poe_exports`):
+
+```bash
+poe-bulk-export export --style export-chat -o poe_exports
+```
+
+Thinking blocks are kept by default. Re-run later with `--incremental` to skip chats that have not changed.
 
 ```bash
 # List your chats (bot, title, chat code)
 poe-bulk-export list
 
-# Export every chat into ./poe_exports
-poe-bulk-export export
+# Preferred: every chat, @export-chat layout
+poe-bulk-export export --style export-chat -o poe_exports
 
-# Export specific chats, opened directly (a chat code or a chat URL; repeatable)
-poe-bulk-export export --chat-code abc123xyz
-poe-bulk-export export -c https://poe.com/chat/abc123xyz -c def456uvw
+# Same, but only chats that changed since the last complete export
+poe-bulk-export export --style export-chat -o poe_exports --incremental
 
-# Same layout as Poe's @export-chat
-poe-bulk-export export --style export-chat
+# One or more specific chats (code or URL; repeatable)
+poe-bulk-export export --style export-chat -o poe_exports --chat-code abc123xyz
+poe-bulk-export export --style export-chat -o poe_exports -c https://poe.com/chat/abc123xyz -c def456uvw
 
-# Markdown and JSON, drop "Thinking..." blocks, save images/files locally
-poe-bulk-export export -f both --strip-thinking --download-attachments
-
-# Later runs: only re-export chats that changed since their last complete export
-poe-bulk-export export --incremental
+# Also write JSON, drop Thinking blocks, and/or save images locally
+poe-bulk-export export --style export-chat -o poe_exports -f both --strip-thinking --download-attachments
 ```
+
+### Mac helpers (double-click)
+
+The [`mac/`](mac/) folder has Finder-friendly `.command` scripts (the Mac equivalent of a `.bat` file). They `cd` to the project, use `.venv`, and load `.env` automatically:
+
+| Double-click | What it does |
+| --- | --- |
+| [`Setup.command`](mac/Setup.command) | Create `.venv`, install the package + Chromium, create `.env` from the example if missing |
+| [`List Chats.command`](mac/List%20Chats.command) | `poe-bulk-export list` |
+| [`Export All Chats.command`](mac/Export%20All%20Chats.command) | Preferred: `export --style export-chat -o poe_exports` |
+| [`Export Changed Only.command`](mac/Export%20Changed%20Only.command) | Same, with `--incremental` |
+| [`Export One Chat.command`](mac/Export%20One%20Chat.command) | Asks for a chat code/URL, then exports that chat |
+| [`Poe Tools.command`](mac/Poe%20Tools.command) | Small menu of the above |
+
+After `git pull`, make them executable once if macOS complains:
+
+```bash
+chmod +x mac/*.command mac/_lib.sh
+```
+
+First time: run **Setup**, edit `.env` with your cookie, then use **Export All Chats** (or **Poe Tools**).
 
 | Option | Meaning |
 | --- | --- |
