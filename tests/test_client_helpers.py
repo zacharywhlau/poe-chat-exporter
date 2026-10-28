@@ -54,7 +54,7 @@ def test_chat_list_node_activity_signature():
 
 
 def test_chat_list_pagination_hash_is_the_documented_value():
-    assert QUERIES["ChatListPaginationQuery"] == "c1a8fd96dd6e0a4679814182951b1e256e175587513c81b223addf931833a692"
+    assert QUERIES["ChatListPaginationQuery"] == "a294b112132f513a057b103d9dc2cc777c64a426850411fe9e7b1b822da2e087"
 
 
 def test_harvest_summary_line():

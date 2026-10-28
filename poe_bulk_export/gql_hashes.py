@@ -15,6 +15,6 @@ QUERIES: dict[str, str] = {
     # pageInfo.hasPreviousPage is true. Only used when scrolling the page does
     # not load older messages by itself.
     "ChatListPaginationQuery": (
-        "c1a8fd96dd6e0a4679814182951b1e256e175587513c81b223addf931833a692"
+        "a294b112132f513a057b103d9dc2cc777c64a426850411fe9e7b1b822da2e087"
     ),
 }
