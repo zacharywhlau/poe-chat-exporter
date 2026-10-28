@@ -28,6 +28,11 @@ class ExportFormat(str, Enum):
     both = "both"
 
 
+class MarkdownStyle(str, Enum):
+    archive = "archive"
+    export_chat = "export-chat"
+
+
 def _resolve_token(token: Optional[str]) -> str:
     value = token or os.environ.get("POE_TOKEN")
     if not value:
@@ -104,6 +109,16 @@ def export_cmd(
         "-f",
         help="Output format.",
     ),
+    style: MarkdownStyle = typer.Option(
+        MarkdownStyle.archive,
+        "--style",
+        help="Markdown layout: archive (default) or export-chat (User:/Bot: turns).",
+    ),
+    include_thinking: bool = typer.Option(
+        False,
+        "--include-thinking/--no-include-thinking",
+        help="Keep model thinking/reasoning blocks (default: strip them).",
+    ),
     output: Path = typer.Option(
         Path("poe_exports"),
         "--output",
@@ -140,12 +155,14 @@ def export_cmd(
         ok = 0
         for chat in tqdm(chats, desc="Exporting", file=sys.stderr):
             try:
-                chat.messages = fetch_messages(client, chat)
+                chat.messages = fetch_messages(
+                    client, chat, include_thinking=include_thinking
+                )
                 if download_attachments:
                     download_chat_attachments(chat, output, cookies=cookies)
 
                 if format in (ExportFormat.markdown, ExportFormat.both):
-                    write_markdown(chat, output)
+                    write_markdown(chat, output, style=style.value)
                 if format in (ExportFormat.json, ExportFormat.both):
                     write_json(chat, output)
                 ok += 1

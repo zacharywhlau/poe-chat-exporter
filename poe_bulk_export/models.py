@@ -23,6 +23,7 @@ class Message:
     content_type: str | None = None
     creation_time_us: int | None = None
     attachments: list[Attachment] = field(default_factory=list)
+    source: str = "unknown"  # network | dom | unknown
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -32,6 +33,7 @@ class Message:
             "contentType": self.content_type,
             "time_epoch_us": self.creation_time_us,
             "attachments": [a.to_dict() for a in self.attachments],
+            "source": self.source,
         }
 
 

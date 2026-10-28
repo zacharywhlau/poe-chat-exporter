@@ -8,6 +8,7 @@ from typing import Any
 
 from playwright.sync_api import Playwright, sync_playwright
 
+from poe_bulk_export.cleanup import cleanup_messages
 from poe_bulk_export.gql_hashes import QUERIES
 from poe_bulk_export.models import Attachment, Chat, Message
 from poe_bulk_export.util import extract_urls_from_text, guess_attachment_name, guess_kind
@@ -108,6 +109,7 @@ def _message_from_node(node: dict[str, Any]) -> Message:
         content_type=node.get("contentType"),
         creation_time_us=node.get("creationTime"),
         attachments=_attachments_from_node(node, text),
+        source="network",
     )
 
 
@@ -207,14 +209,20 @@ def _normalize_for_dedupe(text: str) -> str:
 
 
 def _prefer_message(a: Message, b: Message) -> Message:
-    """Prefer the richer copy when two messages are near-duplicates."""
+    """Prefer network JSON over DOM, then richer / better-labeled copies."""
+    a_net = 1 if a.source == "network" else 0
+    b_net = 1 if b.source == "network" else 0
+    if a_net != b_net:
+        # Network text wins unless it's dramatically shorter/truncated
+        winner, loser = (a, b) if a_net else (b, a)
+        if len(winner.text or "") + 80 >= len(loser.text or ""):
+            return winner
     a_code = (a.text or "").count("```")
     b_code = (b.text or "").count("```")
     if a_code != b_code:
         return a if a_code > b_code else b
     if abs(len(a.text or "") - len(b.text or "")) > 40:
         return a if len(a.text or "") >= len(b.text or "") else b
-    # Prefer labeled human/bot over unknown; prefer timestamped
     a_score = (0 if a.author == "unknown" else 1) + (1 if a.creation_time_us else 0)
     b_score = (0 if b.author == "unknown" else 1) + (1 if b.creation_time_us else 0)
     if a_score != b_score:
@@ -538,23 +546,28 @@ class PoeClient:
               );
               for (const container of containers) {
                 let host = container;
-                for (let i = 0; i < 10 && host; i++) {
+                let author = 'unknown';
+                // Walk ancestors for side / role class names (Poe MessageBubble)
+                for (let i = 0; i < 12 && host; i++) {
                   const cls = String(host.className || '');
-                  if (/Message|Bubble|ChatMessage/i.test(cls)) break;
+                  if (/rightSide|RightSide|UserMessage|Outbound|fromUser/i.test(cls)) {
+                    author = 'human';
+                    break;
+                  }
+                  if (/leftSide|LeftSide|BotMessage|Inbound|fromBot/i.test(cls)) {
+                    author = 'bot';
+                    break;
+                  }
+                  if (/Message|Bubble|ChatMessage/i.test(cls) && host !== container) {
+                    // keep walking a bit more on the bubble for side classes
+                  }
                   host = host.parentElement;
                 }
-                host = host || container;
-                const cls = String(host.className || '');
-                let author = 'unknown';
-                if (/rightSide|RightSide|human|UserMessage|outbound/i.test(cls)) {
-                  author = 'human';
-                } else if (/leftSide|LeftSide|bot|BotMessage|inbound/i.test(cls)) {
-                  author = 'bot';
-                } else {
-                  // Position heuristic: user bubbles often align right
-                  const rect = host.getBoundingClientRect();
+                if (author === 'unknown') {
+                  const rect = container.getBoundingClientRect();
                   const mid = window.innerWidth / 2;
-                  author = rect.left > mid * 0.9 ? 'human' : 'bot';
+                  // User bubbles are typically on the right half
+                  author = rect.left >= mid * 0.55 ? 'human' : 'bot';
                 }
                 push(author, container.innerText || '');
               }
@@ -586,6 +599,7 @@ class PoeClient:
             Message(
                 author=m.get("author") or "unknown",
                 text=m.get("text") or "",
+                source="dom",
             )
             for m in (info.get("messages") or [])
             if m.get("text")
@@ -599,21 +613,25 @@ class PoeClient:
         else:
             key = ("text", msg.author, (msg.text or "")[:240])
         prev = store.get(key)
-        if prev is None or (len(msg.text or "") > len(prev.text or "")):
+        if prev is None:
             store[key] = msg
+        else:
+            store[key] = _prefer_message(prev, msg)
 
     def harvest_chat_messages(
         self,
         chat: Chat,
         *,
         scroll_pages: int = 25,
+        include_thinking: bool = False,
     ) -> list[Message]:
-        """Open the chat page; collect messages from network JSON and the visible DOM."""
+        """Open the chat page; prefer network JSON, fill gaps from the DOM."""
         by_key: dict[Any, Message] = {}
         api_hits = 0
+        network_count = 0
 
         def on_response(response: Any) -> None:
-            nonlocal api_hits
+            nonlocal api_hits, network_count
             url = response.url
             if "poe.com" not in url:
                 return
@@ -625,6 +643,7 @@ class PoeClient:
             except Exception:
                 return
             for node in _walk_message_nodes(data):
+                network_count += 1
                 self._merge_message(by_key, _message_from_node(node))
 
         self.page.on("response", on_response)
@@ -648,6 +667,8 @@ class PoeClient:
                 print(f"  landed on {self.page.url}", file=sys.stderr)
                 opened = True
 
+                # If network already gave full messages, still scrape DOM once
+                # to fill speaker gaps, but network copies win on merge.
                 dom_msgs, page_info = self._scrape_dom_messages()
                 for msg in dom_msgs:
                     self._merge_message(by_key, msg)
@@ -662,12 +683,13 @@ class PoeClient:
 
             for i in range(scroll_pages):
                 before = len(by_key)
+                before_net = network_count
                 self._scroll_chat_up()
                 self.page.wait_for_timeout(1200)
                 dom_msgs, page_info = self._scrape_dom_messages()
                 for msg in dom_msgs:
                     self._merge_message(by_key, msg)
-                if len(by_key) == before:
+                if len(by_key) == before and network_count == before_net:
                     self.page.wait_for_timeout(1500)
                     dom_msgs, page_info = self._scrape_dom_messages()
                     for msg in dom_msgs:
@@ -677,7 +699,8 @@ class PoeClient:
 
             print(
                 f"Harvested {len(by_key)} message(s) "
-                f"(api responses={api_hits}, dom={page_info.get('messageCount', 0)}) "
+                f"(api responses={api_hits}, network_nodes={network_count}, "
+                f"dom={page_info.get('messageCount', 0)}) "
                 f"at {self.page.url}",
                 file=sys.stderr,
             )
@@ -699,8 +722,13 @@ class PoeClient:
 
         messages = _dedupe_messages(list(by_key.values()))
         if any(m.creation_time_us for m in messages):
-            return _sort_messages(messages)
-        return messages
+            messages = _sort_messages(messages)
+        return cleanup_messages(
+            messages,
+            include_thinking=include_thinking,
+            bot_name=chat.bot,
+            bot_handle=chat.bot_handle,
+        )
 
 
 def list_chats(client: PoeClient, limit: int | None = None) -> list[Chat]:
@@ -752,7 +780,12 @@ def list_chats(client: PoeClient, limit: int | None = None) -> list[Chat]:
     return chats
 
 
-def _fetch_messages_graphql(client: PoeClient, chat: Chat) -> list[Message]:
+def _fetch_messages_graphql(
+    client: PoeClient,
+    chat: Chat,
+    *,
+    include_thinking: bool = False,
+) -> list[Message]:
     batches: list[list[Message]] = []
     cursor: str | None = None
 
@@ -784,26 +817,41 @@ def _fetch_messages_graphql(client: PoeClient, chat: Chat) -> list[Message]:
     messages: list[Message] = []
     for batch in reversed(batches):
         messages.extend(batch)
-    return messages
+    return cleanup_messages(
+        messages,
+        include_thinking=include_thinking,
+        bot_name=chat.bot,
+        bot_handle=chat.bot_handle,
+    )
 
 
-def fetch_messages(client: PoeClient, chat: Chat) -> list[Message]:
+def fetch_messages(
+    client: PoeClient,
+    chat: Chat,
+    *,
+    include_thinking: bool = False,
+) -> list[Message]:
     """Prefer browser chat-page harvest; use GraphQL only after it has proven OK."""
     if client._graphql_messages_ok:
         try:
-            return _fetch_messages_graphql(client, chat)
+            return _fetch_messages_graphql(
+                client, chat, include_thinking=include_thinking
+            )
         except Exception as exc:  # noqa: BLE001
             print(
                 f"GraphQL message fetch failed, falling back to page harvest: {exc}",
                 file=sys.stderr,
             )
 
-    messages = client.harvest_chat_messages(chat)
+    messages = client.harvest_chat_messages(
+        chat, include_thinking=include_thinking
+    )
     if messages:
-        # After a successful harvest, try enabling fast GraphQL for later chats.
         if not client._graphql_messages_ok:
             try:
-                gql_msgs = _fetch_messages_graphql(client, chat)
+                gql_msgs = _fetch_messages_graphql(
+                    client, chat, include_thinking=include_thinking
+                )
                 if gql_msgs:
                     client._graphql_messages_ok = True
                     print(
@@ -819,9 +867,10 @@ def fetch_messages(client: PoeClient, chat: Chat) -> list[Message]:
                 )
         return messages
 
-    # Last resort: GraphQL even if harvest was empty
     try:
-        messages = _fetch_messages_graphql(client, chat)
+        messages = _fetch_messages_graphql(
+            client, chat, include_thinking=include_thinking
+        )
         if messages:
             client._graphql_messages_ok = True
             return messages

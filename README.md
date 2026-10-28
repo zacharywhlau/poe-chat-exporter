@@ -78,9 +78,15 @@ poe-bulk-export export -f both -l 10
 # Download attachments into the output folder
 poe-bulk-export export --download-attachments
 
+# Markdown closer to @export-chat (User: / Bot: turns); strip thinking (default)
+poe-bulk-export export --style export-chat
+poe-bulk-export export --include-thinking   # keep reasoning blocks
+
 # Pass token explicitly
 poe-bulk-export export -t 'your_p-b_value'
 ```
+
+Chat pages use `https://poe.com/chat/{code}` (not `/c/`, which often 404s). Exports prefer network message JSON over truncated DOM panes, label You/User vs bot, and strip thinking unless `--include-thinking` is set.
 
 ## How it works
 
