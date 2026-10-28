@@ -1,4 +1,3 @@
-from poe_bulk_export.client import _merge_metadata, _prefer_message
 from poe_bulk_export.models import Chat, Message
 from poe_bulk_export.util import (
     chat_export_stem,
@@ -35,24 +34,6 @@ def test_coerce_ms_and_seconds():
     assert coerce_poe_time_us(1705312200) == 1705312200000000
     assert coerce_poe_time_us(1705312200000) == 1705312200000000
     assert coerce_poe_time_us(1705312200000000) == 1705312200000000
-
-
-def test_prefer_keeps_network_timestamp_when_dom_text_wins():
-    network = Message(
-        author="human",
-        text="short",
-        creation_time_us=1705312200000000,
-        source="network",
-    )
-    dom = Message(
-        author="unknown",
-        text="x" * 200,  # dramatically longer than network + 80
-        source="dom",
-    )
-    merged = _prefer_message(network, dom)
-    assert merged.creation_time_us == 1705312200000000
-    assert len(merged.text) == 200
-
 
 
 def test_chat_export_stem_order():

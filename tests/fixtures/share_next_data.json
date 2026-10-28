@@ -1,0 +1,109 @@
+{
+ "props": {
+  "pageProps": {
+   "data": {
+    "mainQuery": {
+     "chatShare": {
+      "chatBot": {
+       "displayName": "Gemini-1.0-Pro",
+       "__isNode": "Bot",
+       "id": "Qm90OjYwMDQ=",
+       "handle": "Gemini-1.0-Pro",
+       "nickname": "gemini_pro"
+      },
+      "shareCode": "AdtEREDku86PE8rUSHCO",
+      "creationTime": 1710744627310198,
+      "membersCount": 1,
+      "shareId": 4405217,
+      "messagesConnection": {
+       "edges": [
+        {
+         "node": {
+          "id": "UG9lTWVzc2FnZVNoYXJlOjEzNjkyNDc5",
+          "didSkipContext": false,
+          "creationTime": 1710744585686648,
+          "messageId": 13692479,
+          "author": "human",
+          "isChatAnnouncement": false,
+          "isEdited": false,
+          "authorBot": {
+           "id": "Qm90OjE=",
+           "handle": "Human",
+           "nickname": "human",
+           "displayName": "Human",
+           "__isNode": "Bot"
+          },
+          "isAuthorSharer": true,
+          "authorUser": null,
+          "command": null,
+          "referencedMessage": null,
+          "text": "Who is Louis Cha?",
+          "attachments": [],
+          "__isNode": "PoeMessageShare",
+          "__typename": "PoeMessageShare"
+         },
+         "cursor": "13692479",
+         "id": "UG9lTWVzc2FnZVNoYXJlRWRnZToxMzY5MjQ3OQ=="
+        },
+        {
+         "node": {
+          "id": "UG9lTWVzc2FnZVNoYXJlOjEzNjkyNDgw",
+          "didSkipContext": false,
+          "creationTime": 1710744585766838,
+          "messageId": 13692480,
+          "author": "gemini_pro",
+          "isChatAnnouncement": false,
+          "isEdited": false,
+          "authorBot": {
+           "id": "Qm90OjYwMDQ=",
+           "handle": "Gemini-1.0-Pro",
+           "nickname": "gemini_pro",
+           "displayName": "Gemini-1.0-Pro",
+           "__isNode": "Bot"
+          },
+          "isAuthorSharer": false,
+          "authorUser": null,
+          "command": null,
+          "referencedMessage": null,
+          "text": "Louis Cha (1924-2018), also known by his pen name Jin Yong, was a renowned Chinese author, martial artist, and journalist. He is widely considered one of the greatest wuxia (martial arts fiction) writers of all time.\n\n**Key Facts:**\n\n* **Birth Name:** Zha Liangyong\n* **Pen Name:** Jin Yong (meaning \"Golden Eagle\")\n* **Birth Date:** February 10, 1924\n* **Birthplace:** Haining, Zhejiang, China\n* **Death Date:** October 30, 2018\n* **Nationality:** Chinese\n\n**Literary Career:**\n\n* Wrote 15 wuxia novels, including:\n    * The Legend of the Condor Heroes\n    * The Return of the Condor Heroes\n    * The Heavenly Sword and Dragon Sabre\n    * The Deer and the Cauldron\n    * The Smiling, Proud Wanderer\n* His novels are characterized by intricate plots, memorable characters, and philosophical themes.\n* They have been translated into over 30 languages and have sold over 300 million copies worldwide.\n\n**Other Contributions:**\n\n* Co-founded the Hong Kong newspaper Ming Pao in 1959.\n* Served as its editor-in-chief for over 30 years.\n* Was a renowned calligrapher and painter.\n* Established the Jin Yong Foundation to promote Chinese culture and education.\n\n**Legacy:**\n\n* Louis Cha's wuxia novels have had a profound impact on Chinese literature and popular culture.\n* They have inspired numerous adaptations into films, television series, and video games.\n* He is considered one of the most influential Chinese writers of the 20th century.",
+          "attachments": [],
+          "__isNode": "PoeMessageShare",
+          "__typename": "PoeMessageShare"
+         },
+         "cursor": "13692480",
+         "id": "UG9lTWVzc2FnZVNoYXJlRWRnZToxMzY5MjQ4MA=="
+        }
+       ],
+       "pageInfo": {
+        "endCursor": "13692480",
+        "hasNextPage": false
+       },
+       "id": "AdtEREDku86PE8rUSHCO-20-None"
+      },
+      "id": "UG9lQ2hhdFNoYXJlOkFkdEVSRURrdTg2UEU4clVTSENP",
+      "__isNode": "PoeChatShare",
+      "hasMessagesFromMultipleUsers": false
+     }
+    },
+    "leftNavigationSidebarQuery": {
+     "viewer": {
+      "id": "Vmlld2VyOjA="
+     },
+     "chats": {
+      "edges": [],
+      "pageInfo": {
+       "endCursor": null,
+       "hasNextPage": false
+      },
+      "id": "5-None-None"
+     }
+    }
+   }
+  }
+ },
+ "page": "/s/[shareCode]",
+ "query": {
+  "shareCode": "AdtEREDku86PE8rUSHCO"
+ },
+ "buildId": "enuKISufiTsh5xDSa7oer"
+}

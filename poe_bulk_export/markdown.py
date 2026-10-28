@@ -1,123 +1,141 @@
+"""Markdown rendering.
+
+Both styles share one transcript body, the layout Poe's ``@export-chat`` bot
+produces: a speaker line, a blank line, the raw message markdown, and a
+``---`` rule between turns::
+
+    User:
+
+    How do I rebase?
+
+    ---
+
+    Claude-Fable-5:
+
+    ## Rebasing
+    …
+
+``export-chat`` is exactly that body (no header, no trailing newline).
+``archive`` adds YAML front matter and an invisible HTML comment with the time
+and message id in front of each turn.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
 
+from poe_bulk_export import __version__
 from poe_bulk_export.models import Chat, Message
-from poe_bulk_export.util import (
-    chat_export_stem,
-    epoch_us_to_iso,
-    now_iso,
-    unique_path,
-    yaml_escape,
-)
+from poe_bulk_export.util import epoch_us_to_iso_z, now_iso_z, yaml_escape
+from poe_bulk_export.writer import chat_output_path, write_text_file
+
+STYLES = ("archive", "export-chat")
+TURN_SEPARATOR = "\n\n---\n\n"
+CHAT_BREAK = "*— Context cleared —*"
 
 
-def display_author(author: str, bot_name: str, *, style: str = "archive") -> str:
-    if author in ("human", "user", "User", "You"):
-        return "User" if style == "export-chat" else "You"
-    if author in ("chat_break", "ChatBreak"):
-        return "— break —"
-    if author in ("bot", "Bot", "assistant", "unknown"):
-        return bot_name or "Bot"
-    if bot_name and author.lower().replace("-", "_") == bot_name.lower().replace(
-        "-", "_"
-    ).replace(" ", "_"):
-        return bot_name
-    if author:
-        return author
-    return bot_name or "Bot"
+def speaker_label(message: Message, chat: Chat) -> str:
+    if message.author == "human":
+        return "User"
+    if message.author == "system":
+        return "Poe"
+    return message.author_name or chat.bot or "Bot"
 
 
 def render_message_body(message: Message) -> str:
+    """Message markdown plus any attachment not already linked in the text."""
     text = (message.text or "").rstrip()
-
     for att in message.attachments:
         if att.local_path and att.url and att.url in text:
             text = text.replace(att.url, att.local_path)
 
-    parts: list[str] = []
-    if text:
-        parts.append(text)
-
-    body_for_dup = text.lower()
+    parts = [text] if text else []
+    haystack = text.lower()
     for att in message.attachments:
         target = att.local_path or att.url
         if not target:
             continue
-        if target.lower() in body_for_dup:
-            continue
-        if att.url and att.url.lower() in body_for_dup:
+        if target.lower() in haystack or (att.url and att.url.lower() in haystack):
             continue
         label = att.name or "attachment"
-        if att.kind == "image":
-            parts.append(f"![{label}]({target})")
-        else:
-            parts.append(f"[{label}]({target})")
-
-    return "\n\n".join(parts).rstrip()
+        parts.append(f"![{label}]({target})" if att.kind == "image" else f"[{label}]({target})")
+    return "\n\n".join(parts)
 
 
-def render_archive_markdown(
-    chat: Chat,
-    *,
-    exported_at: str | None = None,
-    style: str = "archive",
-) -> str:
-    exported = exported_at or now_iso()
-    if style == "export-chat":
-        return render_export_chat_markdown(chat)
+def _turn_comment(message: Message) -> str | None:
+    details = []
+    when = epoch_us_to_iso_z(message.creation_time_us)
+    if when:
+        details.append(when)
+    if message.message_id is not None:
+        details.append(f"message {message.message_id}")
+    return f"<!-- {' · '.join(details)} -->" if details else None
 
-    lines: list[str] = [
-        "---",
-        f"title: {yaml_escape(chat.title)}",
-        f"bot: {yaml_escape(chat.bot)}",
-        f"chat_id: {chat.chat_id}",
-        f"chat_code: {yaml_escape(chat.chat_code)}",
-        f"exported_at: {exported}",
-        f"message_count: {len(chat.messages)}",
-        "---",
-        "",
-        f"# {chat.title}",
-        "",
-    ]
 
-    for message in chat.messages:
-        author = display_author(message.author, chat.bot, style=style)
-        ts = epoch_us_to_iso(message.creation_time_us)
-        heading = f"## {author}"
-        if ts:
-            heading += f" · {ts}"
-        lines.append(heading)
-        lines.append("")
+def render_turn(message: Message, chat: Chat, *, annotate: bool = False) -> str:
+    if message.author == "chat_break":
+        turn = CHAT_BREAK
+    else:
         body = render_message_body(message)
+        turn = f"{speaker_label(message, chat)}:"
         if body:
-            lines.append(body)
-            lines.append("")
-        else:
-            lines.append("_(empty message)_")
-            lines.append("")
+            turn += f"\n\n{body}"
+    if annotate:
+        comment = _turn_comment(message)
+        if comment:
+            turn = f"{comment}\n{turn}"
+    return turn
 
-    return "\n".join(lines).rstrip() + "\n"
+
+def render_transcript(chat: Chat, *, annotate: bool = False) -> str:
+    return TURN_SEPARATOR.join(render_turn(m, chat, annotate=annotate) for m in chat.messages)
 
 
-def render_export_chat_markdown(chat: Chat) -> str:
-    """Markdown shaped like @export-chat (User: / Bot: turns)."""
-    lines: list[str] = []
-    for message in chat.messages:
-        author = display_author(message.author, chat.bot, style="export-chat")
-        lines.append(f"{author}:")
-        lines.append("")
-        body = render_message_body(message)
-        lines.append(body if body else "_(empty message)_")
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-    lines.append(
-        "*Exported with poe-bulk-export · style export-chat "
-        "(compatible with [@export-chat](https://poe.com/export-chat))*"
-    )
-    lines.append("")
-    return "\n".join(lines)
+def render_export_chat(chat: Chat) -> str:
+    """Byte-for-byte the layout of ``@export-chat``."""
+    return render_transcript(chat)
+
+
+def _yaml_value(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return yaml_escape(str(value))
+
+
+def front_matter(chat: Chat, *, exported_at: str | None = None) -> str:
+    times = [m.creation_time_us for m in chat.messages if m.creation_time_us is not None]
+    fields: list[tuple[str, object]] = [
+        ("title", chat.title),
+        ("bot", chat.bot),
+        ("chat_code", chat.chat_code),
+        ("chat_id", chat.chat_id),
+        ("url", chat.url),
+        ("created", epoch_us_to_iso_z(min(times)) if times else None),
+        ("updated", epoch_us_to_iso_z(max(times)) if times else None),
+        ("message_count", len(chat.messages)),
+        ("complete", chat.complete),
+        ("source", chat.source or "raw"),
+        ("exported_at", exported_at or now_iso_z()),
+        ("exporter", f"poe-bulk-export {__version__}"),
+    ]
+    lines = ["---", *(f"{key}: {_yaml_value(value)}" for key, value in fields), "---"]
+    return "\n".join(lines) + "\n"
+
+
+def render_archive(chat: Chat, *, exported_at: str | None = None) -> str:
+    return f"{front_matter(chat, exported_at=exported_at)}\n{render_transcript(chat, annotate=True)}\n"
+
+
+def render_markdown(chat: Chat, style: str = "archive", *, exported_at: str | None = None) -> str:
+    if style == "export-chat":
+        return render_export_chat(chat)
+    if style == "archive":
+        return render_archive(chat, exported_at=exported_at)
+    raise ValueError(f"Unknown style {style!r}; expected one of {', '.join(STYLES)}")
 
 
 def write_markdown(
@@ -125,18 +143,8 @@ def write_markdown(
     output_dir: Path,
     *,
     style: str = "archive",
+    exported_at: str | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = chat_export_stem(
-        title=chat.title,
-        bot=chat.bot,
-        messages=chat.messages,
-        chat_code=chat.chat_code,
-        fallback_time_us=chat.activity_time_us,
-    )
-    path = unique_path(output_dir, stem, ".md")
-    path.write_text(
-        render_archive_markdown(chat, style=style),
-        encoding="utf-8",
-    )
-    return path
+    path = chat_output_path(output_dir, chat, ".md")
+    return write_text_file(path, render_markdown(chat, style, exported_at=exported_at))

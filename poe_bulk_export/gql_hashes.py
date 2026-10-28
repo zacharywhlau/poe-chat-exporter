@@ -1,21 +1,20 @@
 """Persisted GraphQL query hashes for Poe's unofficial API.
 
-These hashes change when Poe redeploys queries. If exports start failing with
-PersistedQueryNotFound, update the values here (one-file fix).
+Poe changes these when it redeploys queries. The client also learns the
+current hash of every query the page itself sends, so live values override
+these defaults. If listing fails with PersistedQueryNotFound, update the value
+here.
 """
 
 QUERIES: dict[str, str] = {
-    # Conversation list (sidebar history)
+    # Conversation list (sidebar history), paged forward with endCursor.
     "ChatHistoryListPaginationQuery": (
         "6ce01455b0201e625489da90c65f87a2809d212ea41ab6e39412b6913990e81f"
     ),
-    # Messages within one chat (older pages via startCursor)
-    # May be auto-updated at runtime from live browser traffic.
+    # Messages of one chat, paged backward (older) with startCursor while
+    # pageInfo.hasPreviousPage is true. Only used when scrolling the page does
+    # not load older messages by itself.
     "ChatListPaginationQuery": (
-        "c1a8fd96dd6e0a4679814182951b1e256e175587513c81b223addf931833a625"
-    ),
-    # Single chat page (fallback when pagination query fails)
-    "ChatPageQuery": (
-        "e7dcf93e713a35a6b5642496b78339c9ef5ff0ae5e7e0c150ef534a738cced8c"
+        "c1a8fd96dd6e0a4679814182951b1e256e175587513c81b223addf931833a692"
     ),
 }

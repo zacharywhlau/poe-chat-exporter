@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)")
 _MD_LINK = re.compile(r"(?<!!)\[([^\]]*)\]\((https?://[^)\s]+)\)")
@@ -136,8 +135,23 @@ def epoch_us_to_iso(epoch_us: int | str | None) -> str:
         return str(epoch_us)
 
 
+def epoch_us_to_iso_z(epoch_us: int | str | None) -> str:
+    """Second-precision UTC timestamp, e.g. 2026-10-28T07:50:14Z ("" if unknown)."""
+    if epoch_us is None or epoch_us == "":
+        return ""
+    try:
+        dt = datetime.fromtimestamp(int(epoch_us) / 1_000_000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def now_iso_z() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def guess_attachment_name(url: str, fallback: str = "attachment") -> str:

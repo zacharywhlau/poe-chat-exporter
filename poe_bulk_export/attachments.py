@@ -7,9 +7,8 @@ from urllib.parse import urlparse
 
 import httpx
 
-from poe_bulk_export.models import Attachment, Chat
+from poe_bulk_export.models import Chat
 from poe_bulk_export.util import guess_attachment_name, sanitize_filename
-
 
 _SAFE_EXT = re.compile(r"^[a-zA-Z0-9]{1,8}$")
 _MEDIA_TYPES = (
@@ -56,13 +55,9 @@ def _looks_like_real_media(content_type: str | None, content: bytes) -> bool:
     if any(ctype.startswith(prefix) or ctype == prefix for prefix in _MEDIA_TYPES):
         # Guard: HTML mistaken as octet-stream
         head = content[:200].lstrip().lower()
-        if head.startswith((b"<!doctype html", b"<html")):
-            return False
-        return True
+        return not head.startswith((b"<!doctype html", b"<html"))
     # Sniff images
-    if content.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF8", b"RIFF")):
-        return True
-    return False
+    return content.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF8", b"RIFF"))
 
 
 def is_skip_attachment_url(url: str) -> bool:
@@ -75,6 +70,7 @@ def download_chat_attachments(
     output_dir: Path,
     *,
     cookies: dict[str, str] | None = None,
+    user_agent: str | None = None,
     timeout: float = 60.0,
 ) -> int:
     """Download real media only; skip HTML/error pages.
@@ -91,11 +87,7 @@ def download_chat_attachments(
 
     downloaded = 0
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": user_agent or "Mozilla/5.0 (compatible; poe-bulk-export)",
         "Referer": "https://poe.com/",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     }
@@ -113,7 +105,7 @@ def download_chat_attachments(
                 try:
                     resp = client.get(att.url)
                     resp.raise_for_status()
-                except Exception:
+                except (httpx.HTTPError, httpx.InvalidURL):
                     continue
 
                 ctype = resp.headers.get("content-type")
@@ -134,23 +126,3 @@ def download_chat_attachments(
                 downloaded += 1
 
     return downloaded
-
-
-def ensure_inline_markdown_embeds(chat: Chat) -> None:
-    """Make sure each attachment URL appears inline in message text (chat-like)."""
-    for message in chat.messages:
-        text = message.text or ""
-        for att in message.attachments:
-            if not att.url or is_skip_attachment_url(att.url):
-                continue
-            if att.url in text:
-                continue
-            label = att.name or "attachment"
-            if att.kind == "image" or any(
-                att.url.lower().endswith(ext)
-                for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")
-            ):
-                text = f"{text.rstrip()}\n\n![{label}]({att.url})"
-            else:
-                text = f"{text.rstrip()}\n\n[{label}]({att.url})"
-        message.text = text

@@ -1,96 +1,100 @@
-from __future__ import annotations
+import pytest
 
-import json
-from pathlib import Path
-
-from poe_bulk_export.markdown import display_author, render_archive_markdown, write_markdown
+from poe_bulk_export.markdown import (
+    render_archive,
+    render_export_chat,
+    render_markdown,
+    render_message_body,
+    speaker_label,
+)
 from poe_bulk_export.models import Attachment, Chat, Message
-from poe_bulk_export.util import epoch_us_to_iso, extract_urls_from_text, sanitize_filename
 
 
-FIXTURE = Path(__file__).parent / "fixtures" / "sample_chat.json"
-
-
-def chat_from_fixture() -> Chat:
-    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    messages = []
-    for m in raw["messages"]:
-        messages.append(
-            Message(
-                author=m["author"],
-                text=m["text"],
-                message_id=m.get("messageId"),
-                content_type=m.get("contentType"),
-                creation_time_us=m.get("time_epoch_us"),
-                attachments=[
-                    Attachment(
-                        url=a["url"],
-                        name=a.get("name") or "attachment",
-                        kind=a.get("kind") or "file",
-                        local_path=a.get("local_path"),
-                    )
-                    for a in m.get("attachments") or []
-                ],
-            )
-        )
+def _chat(*messages: Message, bot: str = "Claude-Fable-5") -> Chat:
     return Chat(
-        chat_id=raw["chatId"],
-        chat_code=raw["chatCode"],
-        node_id=raw["id"],
-        title=raw["title"],
-        bot=raw["bot"],
-        messages=messages,
+        chat_id=42,
+        chat_code="abc123",
+        title='Release "plan"',
+        bot=bot,
+        messages=list(messages),
+        complete=True,
+        source="raw",
     )
 
 
-def test_sanitize_filename():
-    assert sanitize_filename('a/b:c*?"') == "a_b_c___"
-    assert sanitize_filename("   ") == "Untitled"
+def test_speaker_labels():
+    chat = _chat()
+    assert speaker_label(Message(author="human", text="x"), chat) == "User"
+    assert speaker_label(Message(author="bot", text="x", author_name="GPT-5"), chat) == "GPT-5"
+    assert speaker_label(Message(author="bot", text="x"), chat) == "Claude-Fable-5"
+    assert speaker_label(Message(author="unknown", text="x"), _chat(bot="")) == "Bot"
+    assert speaker_label(Message(author="system", text="x"), chat) == "Poe"
 
 
-def test_epoch_us_to_iso():
-    assert epoch_us_to_iso(1705312200000000).startswith("2024-01-15T")
-    assert epoch_us_to_iso(None) == ""
-
-
-def test_display_author():
-    assert display_author("human", "Claude") == "You"
-    assert display_author("bot", "Claude") == "Claude"
-    assert display_author("AssistantX", "Claude") == "AssistantX"
-
-
-def test_extract_urls_from_text():
-    text = "see ![x](https://qph.cf2.poecdn.net/a.png) and https://qph.cf2.poecdn.net/b.jpg"
-    urls = extract_urls_from_text(text)
-    assert any("a.png" in u for _, u in urls)
-    assert any("b.jpg" in u for _, u in urls)
-
-
-def test_render_archive_markdown_shape():
-    chat = chat_from_fixture()
-    md = render_archive_markdown(chat, exported_at="2026-10-28T00:00:00+00:00")
-
-    assert md.startswith("---\n")
-    assert 'title: "Sample Poe Chat"' in md
-    assert "chat_id: 12345" in md
-    assert "chat_code: \"abc123\"" in md
-    assert "exported_at: 2026-10-28T00:00:00+00:00" in md
-    assert "# Sample Poe Chat" in md
-    assert "## You ·" in md
-    assert "Hello — please summarize this." in md
-    assert "![example.png](https://qph.cf2.poecdn.net/example.png)" in md
-    # Local path rewrites CDN URL already present in the message body
-    assert "attachments/abc123/msg-1003-0-sketch.jpg" in md
-    assert "https://qph.cf2.poecdn.net/sketch.jpg" not in md
-
-
-def test_write_markdown(tmp_path: Path):
-    chat = chat_from_fixture()
-    path = write_markdown(chat, tmp_path)
-    assert path.exists()
-    assert path.suffix == ".md"
-    assert "Sample Poe Chat" in path.read_text(encoding="utf-8")
-    # date_model_title__code
-    assert path.name.startswith(
-        "2024-01-15_Claude-Sonnet-4.5_Sample_Poe_Chat__abc123"
+def test_export_chat_layout():
+    chat = _chat(
+        Message(author="human", text="hi"),
+        Message(author="bot", text="## Heading\n\n```bash\ngit status\n```"),
     )
+    assert render_export_chat(chat) == (
+        "User:\n\nhi\n\n---\n\nClaude-Fable-5:\n\n## Heading\n\n```bash\ngit status\n```"
+    )
+
+
+def test_chat_break_and_empty_turns():
+    chat = _chat(
+        Message(author="human", text="a"),
+        Message(author="chat_break", text=""),
+        Message(author="bot", text=""),
+    )
+    assert render_export_chat(chat) == "User:\n\na\n\n---\n\n*— Context cleared —*\n\n---\n\nClaude-Fable-5:"
+
+
+def test_attachments_are_added_once_and_use_local_paths():
+    image = Attachment(url="https://pfst.cf2.poecdn.net/img.png", name="img.png", kind="image")
+    doc = Attachment(url="https://pfst.cf2.poecdn.net/doc.pdf", name="doc.pdf", kind="file")
+    assert render_message_body(Message(author="human", text="look", attachments=[image, doc])) == (
+        "look\n\n![img.png](https://pfst.cf2.poecdn.net/img.png)\n\n[doc.pdf](https://pfst.cf2.poecdn.net/doc.pdf)"
+    )
+
+    inline = Message(author="bot", text="![x](https://pfst.cf2.poecdn.net/img.png)", attachments=[image])
+    assert render_message_body(inline) == "![x](https://pfst.cf2.poecdn.net/img.png)"
+
+    local = Attachment(url=image.url, name="img.png", kind="image", local_path="attachments/abc123/msg-1-0-img.png")
+    assert render_message_body(Message(author="bot", text=f"![x]({image.url})", attachments=[local])) == (
+        "![x](attachments/abc123/msg-1-0-img.png)"
+    )
+
+
+def test_archive_front_matter_and_turn_comments():
+    chat = _chat(
+        Message(author="human", text="hi", message_id=7, creation_time_us=1705312200000000),
+        Message(author="bot", text="hello", message_id=8, creation_time_us=1705312205000000),
+    )
+    out = render_archive(chat, exported_at="2024-01-16T00:00:00Z")
+    assert out == (
+        "---\n"
+        'title: "Release \\"plan\\""\n'
+        'bot: "Claude-Fable-5"\n'
+        'chat_code: "abc123"\n'
+        "chat_id: 42\n"
+        'url: "https://poe.com/chat/abc123"\n'
+        'created: "2024-01-15T09:50:00Z"\n'
+        'updated: "2024-01-15T09:50:05Z"\n'
+        "message_count: 2\n"
+        "complete: true\n"
+        'source: "raw"\n'
+        'exported_at: "2024-01-16T00:00:00Z"\n'
+        'exporter: "poe-bulk-export 0.2.0"\n'
+        "---\n"
+        "\n"
+        "<!-- 2024-01-15T09:50:00Z · message 7 -->\n"
+        "User:\n\nhi\n\n---\n\n"
+        "<!-- 2024-01-15T09:50:05Z · message 8 -->\n"
+        "Claude-Fable-5:\n\nhello\n"
+    )
+
+
+def test_render_markdown_rejects_unknown_style():
+    with pytest.raises(ValueError):
+        render_markdown(_chat(), "fancy")

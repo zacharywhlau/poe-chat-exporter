@@ -2,23 +2,34 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Playwright, sync_playwright
 
-from poe_bulk_export.attachments import is_skip_attachment_url
-from poe_bulk_export.cleanup import cleanup_messages, normalize_author
-from poe_bulk_export.gql_hashes import QUERIES
-from poe_bulk_export.models import Attachment, Chat, Message
-from poe_bulk_export.util import (
-    coerce_poe_time_us,
-    extract_urls_from_text,
-    guess_attachment_name,
-    guess_kind,
+from poe_bulk_export import page_scripts
+from poe_bulk_export.dom_fallback import messages_from_dom
+from poe_bulk_export.extract import (
+    ChatInfo,
+    ChatTarget,
+    Extraction,
+    PageInfo,
+    combine_extractions,
+    extract_from_graphql,
+    extract_from_next_data,
+    extract_from_relay_records,
+    find_chat_info,
+    parse_graphql_body,
 )
+from poe_bulk_export.gql_hashes import QUERIES
+from poe_bulk_export.models import Chat, Message
+from poe_bulk_export.util import coerce_poe_time_us
+
+Log = Callable[[str], None]
 
 # Poe signs each gql_POST body with md5(body + formkey + salt).
 _TAG_SALTS = [
@@ -26,6 +37,10 @@ _TAG_SALTS = [
     "WpuLMiXEKKE98j56k",
 ]
 _active_salt: str = _TAG_SALTS[0]
+
+
+class NotLoggedInError(RuntimeError):
+    pass
 
 
 def _payload_json(query_name: str, variables: dict[str, Any]) -> str:
@@ -47,8 +62,6 @@ def _learn_salt(payload_str: str, formkey: str, tag_id: str) -> str | None:
     global _active_salt
     for salt in _TAG_SALTS:
         if _poe_tag_id(payload_str, formkey, salt) == tag_id:
-            if salt != _active_salt:
-                print(f"Learned poe-tag salt: {salt[:6]}…", file=sys.stderr)
             _active_salt = salt
             return salt
     return None
@@ -56,615 +69,175 @@ def _learn_salt(payload_str: str, formkey: str, tag_id: str) -> str | None:
 
 def _update_hash_from_payload(payload: dict[str, Any]) -> None:
     name = payload.get("queryName")
-    extensions = payload.get("extensions") or {}
-    digest = extensions.get("hash")
-    if not name or not digest:
-        return
-    prev = QUERIES.get(name)
-    QUERIES[name] = digest
-    if prev != digest:
-        print(f"Learned GraphQL hash for {name}", file=sys.stderr)
+    digest = (payload.get("extensions") or {}).get("hash")
+    if name and digest:
+        QUERIES[name] = digest
 
 
-def _attachments_from_node(node: dict[str, Any], text: str) -> list[Attachment]:
-    attachments: list[Attachment] = []
-    seen: set[str] = set()
-
-    raw_list = node.get("attachments") or node.get("fileAttachments") or []
-    if isinstance(raw_list, list):
-        for item in raw_list:
-            if not isinstance(item, dict):
-                continue
-            url = (
-                item.get("url")
-                or item.get("fileUrl")
-                or item.get("attachmentUrl")
-                or item.get("downloadUrl")
-                or ""
-            )
-            if not url or url in seen or is_skip_attachment_url(url):
-                continue
-            seen.add(url)
-            name = (
-                item.get("name")
-                or item.get("filename")
-                or guess_attachment_name(url)
-            )
-            attachments.append(
-                Attachment(url=url, name=name, kind=guess_kind(url, name))
-            )
-
-    for name, url in extract_urls_from_text(text):
-        if url in seen or is_skip_attachment_url(url):
-            continue
-        # Real media CDNs only — not poe.com HTML pages
-        if "poecdn" not in url.lower():
-            continue
-        seen.add(url)
-        attachments.append(
-            Attachment(url=url, name=name, kind=guess_kind(url, name))
-        )
-
-    return attachments
+def normalize_user_agent(user_agent: str) -> str:
+    """Headless Chromium's UA with the "HeadlessChrome" giveaway removed."""
+    return (user_agent or "").replace("HeadlessChrome/", "Chrome/")
 
 
-def _node_time_us(node: dict[str, Any]) -> int | None:
-    for key in (
-        "creationTime",
-        "createdAt",
-        "timestamp",
-        "time",
-        "sentAt",
-        "updatedAt",
-        "lastMessageTime",
-        "lastMessageCreationTime",
-    ):
-        if key in node and node.get(key) is not None:
-            coerced = coerce_poe_time_us(node.get(key))
-            if coerced is not None:
-                return coerced
-    return None
-
-
-def _message_from_node(node: dict[str, Any]) -> Message:
-    text = node.get("text") or ""
-    return Message(
-        author=node.get("author") or "unknown",
-        text=text,
-        message_id=node.get("messageId"),
-        content_type=node.get("contentType"),
-        creation_time_us=_node_time_us(node),
-        attachments=_attachments_from_node(node, text),
-        source="network",
-    )
-
-
-def _walk_message_nodes(obj: Any) -> list[dict[str, Any]]:
-    """Deep-scan a GraphQL JSON payload for message-like dicts."""
-    found: list[dict[str, Any]] = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            if "messageId" in value and (
-                "text" in value or "author" in value or "contentType" in value
-            ):
-                found.append(value)
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(obj)
-    return found
-
-
-def _sort_messages(messages: list[Message]) -> list[Message]:
-    def sort_key(m: Message) -> tuple:
+def _query_meta(post_data: str | None, headers: dict[str, str] | None = None) -> tuple[str | None, dict[str, Any] | None]:
+    name = (headers or {}).get("poe-queryname")
+    variables = None
+    if post_data:
         try:
-            t = int(m.creation_time_us or 0)
-        except (TypeError, ValueError):
-            t = 0
-        try:
-            mid = int(m.message_id) if m.message_id is not None else 0
-        except (TypeError, ValueError):
-            mid = 0
-        return (t, mid)
-
-    messages.sort(key=sort_key)
-    return messages
+            payload = json.loads(post_data)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            name = payload.get("queryName") or name
+            if isinstance(payload.get("variables"), dict):
+                variables = payload["variables"]
+    return name, variables
 
 
 def _chat_urls(chat: Chat) -> list[str]:
-    urls: list[str] = []
+    """Candidate URLs for a chat; /chat/{code} is the current canonical one."""
     code = chat.chat_code
-    handle = (chat.bot_handle or "").strip().lstrip("@")
-    if code:
-        # Prefer /chat/ — /c/ often 404s on current Poe.
-        urls.extend(
-            [
-                f"https://poe.com/chat/{code}",
-                f"https://poe.com/c/{code}",
-            ]
-        )
-        if handle:
-            urls.extend(
-                [
-                    f"https://poe.com/{handle}/{code}",
-                    f"https://poe.com/{handle}?chat={code}",
-                ]
-            )
-    # De-dupe, preserve order
-    seen: set[str] = set()
-    out: list[str] = []
-    for url in urls:
-        if url not in seen:
-            seen.add(url)
-            out.append(url)
-    return out
-
-
-_UI_CHROME = {
-    "thinking",
-    "thinking...",
-    "*thinking...*",
-    "view all",
-    "run",
-    "copy",
-    "edited",
-    "regenerate",
-}
-
-
-def _looks_like_ui_chrome(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return True
-    if t in _UI_CHROME:
-        return True
-    # Truncated virtualized code panes from the Poe UI
-    if t.startswith("python\nview all") or t.startswith("python\nView all".lower()):
-        return True
-    if "\nview all\n" in f"\n{t}\n" and len(t) < 800 and "```" not in t:
-        return True
-    return False
-
-
-_BARE_LANG_LINE = re.compile(
-    r"(?mi)^\s*(?:bash|sh|shell|zsh|python|py|yaml|yml|json|javascript|js|"
-    r"typescript|ts|html|css|sql|toml|ini|gitignore|dockerfile|docker|"
-    r"console|text|plaintext|markdown|md|xml|rust|go|ruby|java|c|cpp|"
-    r"csharp|swift|kotlin|r|php|diff|makefile)\s*$"
-)
-
-
-def _normalize_for_dedupe(text: str) -> str:
-    """Fingerprint that ignores markdown fences so DOM/network copies match."""
-    t = text or ""
-    t = re.sub(r"```[\w+-]*\n?", "\n", t)
-    t = _BARE_LANG_LINE.sub("\n", t)
-    # Horizontal rules and ATX headings differ between DOM plain text and MD
-    t = re.sub(r"(?m)^\s*-{3,}\s*$", "\n", t)
-    t = re.sub(r"(?m)^\s*#{1,6}\s*", "", t)
-    t = re.sub(r"[*_`>~]+", " ", t)
-    return " ".join(t.split()).lower()
-
-
-def _speaker_side(author: str) -> str:
-    a = normalize_author(author or "")
-    if a == "human":
-        return "human"
-    if a in ("unknown", ""):
-        return "unknown"
-    return "bot"
-
-
-def _same_speaker(a: str, b: str) -> bool:
-    sa, sb = _speaker_side(a), _speaker_side(b)
-    if sa == "unknown" or sb == "unknown":
-        return True
-    return sa == sb
-
-
-def _chunk_hit_ratio(shorter: str, longer: str, chunk: int = 72, step: int = 72) -> float:
-    """How many windows of shorter appear inside longer (markdown-noise tolerant)."""
-    if not shorter:
-        return 0.0
-    if shorter in longer:
-        return 1.0
-    if len(shorter) < chunk:
-        return 1.0 if shorter in longer else 0.0
-    hits = 0
-    total = 0
-    for start in range(0, len(shorter) - chunk + 1, step):
-        total += 1
-        if shorter[start : start + chunk] in longer:
-            hits += 1
-    return hits / max(total, 1)
-
-
-def _overlap_score(a: str, b: str) -> float:
-    fa, fb = _normalize_for_dedupe(a), _normalize_for_dedupe(b)
-    if not fa or not fb:
-        return 0.0
-    if fa == fb:
-        return 1.0
-    shorter, longer = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
-    if shorter in longer:
-        return len(shorter) / max(len(longer), 1)
-
-    # Shared prefix — network markdown vs DOM plain text often diverge mid-body
-    # after a long identical lead-in.
-    i = 0
-    limit = min(len(fa), len(fb))
-    while i < limit and fa[i] == fb[i]:
-        i += 1
-    prefix_ratio = i / max(len(fa), len(fb), 1)
-    if i >= 60 and prefix_ratio >= 0.35:
-        return max(0.6, prefix_ratio)
-    if i >= 100:
-        return 0.7
-
-    # Long near-duplicates that diverge early on formatting still share body chunks
-    if len(shorter) >= 400:
-        hit = _chunk_hit_ratio(shorter, longer)
-        if hit >= 0.55:
-            return max(0.65, hit)
-
-    n = min(120, len(fa), len(fb))
-    if n >= 40 and fa[:n] == fb[:n]:
-        return 0.8
-    return 0.0
-
-
-def _merge_metadata(winner: Message, other: Message) -> Message:
-    """Keep timestamps / ids from either side when the chosen text wins."""
-    return Message(
-        author=(
-            winner.author
-            if winner.author not in ("", "unknown")
-            else other.author
-        ),
-        text=winner.text,
-        message_id=winner.message_id
-        if winner.message_id is not None
-        else other.message_id,
-        content_type=winner.content_type or other.content_type,
-        creation_time_us=winner.creation_time_us
-        if winner.creation_time_us is not None
-        else other.creation_time_us,
-        attachments=winner.attachments or other.attachments,
-        source=winner.source
-        if winner.source != "unknown"
-        else other.source,
-    )
-
-
-def _prefer_message(a: Message, b: Message) -> Message:
-    """Prefer network JSON over DOM, then richer / better-labeled copies."""
-    a_net = 1 if a.source == "network" else 0
-    b_net = 1 if b.source == "network" else 0
-    a_fences = (a.text or "").count("```")
-    b_fences = (b.text or "").count("```")
-    # Strong preference: real markdown fences beat bare language tags
-    if a_fences != b_fences:
-        winner, loser = (a, b) if a_fences > b_fences else (b, a)
-        if len(winner.text or "") + 120 >= len(loser.text or ""):
-            return _merge_metadata(winner, loser)
-    if a_net != b_net:
-        # Network text wins unless it's dramatically shorter/truncated
-        winner, loser = (a, b) if a_net else (b, a)
-        if len(winner.text or "") + 80 >= len(loser.text or ""):
-            return _merge_metadata(winner, loser)
-        # DOM was much longer — keep DOM text but preserve network metadata
-        return _merge_metadata(loser, winner)
-    if abs(len(a.text or "") - len(b.text or "")) > 40:
-        return _merge_metadata(
-            *((a, b) if len(a.text or "") >= len(b.text or "") else (b, a))
-        )
-    a_score = (0 if a.author == "unknown" else 1) + (1 if a.creation_time_us else 0)
-    b_score = (0 if b.author == "unknown" else 1) + (1 if b.creation_time_us else 0)
-    if a_score != b_score:
-        return _merge_metadata(*( (a, b) if a_score > b_score else (b, a) ))
-    return _merge_metadata(
-        *((a, b) if len(a.text or "") >= len(b.text or "") else (b, a))
-    )
-
-
-def _dedupe_messages(messages: list[Message]) -> list[Message]:
-    """Drop UI chrome and keep the best copy of overlapping turns."""
-    cleaned = [m for m in messages if not _looks_like_ui_chrome(m.text)]
-    kept: list[Message] = []
-    for msg in cleaned:
-        norm = _normalize_for_dedupe(msg.text)
-        if not norm:
-            continue
-        replaced = False
-        for i, prev in enumerate(kept):
-            if not _same_speaker(prev.author, msg.author):
-                continue
-            prev_norm = _normalize_for_dedupe(prev.text)
-            # Same id
-            if (
-                msg.message_id is not None
-                and prev.message_id is not None
-                and msg.message_id == prev.message_id
-            ):
-                kept[i] = _prefer_message(prev, msg)
-                replaced = True
-                break
-            score = _overlap_score(msg.text, prev.text)
-            if score >= 0.5:
-                kept[i] = _prefer_message(prev, msg)
-                replaced = True
-                break
-            # One contains the other (truncated DOM vs full answer)
-            if norm in prev_norm or prev_norm in norm:
-                if abs(len(norm) - len(prev_norm)) < max(
-                    80, int(0.2 * max(len(norm), len(prev_norm)))
-                ):
-                    kept[i] = _prefer_message(prev, msg)
-                    replaced = True
-                    break
-                if len(norm) > len(prev_norm) and prev_norm in norm:
-                    kept[i] = _prefer_message(prev, msg)
-                    replaced = True
-                    break
-                if len(prev_norm) > len(norm) and norm in prev_norm:
-                    replaced = True
-                    break
-        if not replaced:
-            kept.append(msg)
-    return kept
-
-
-def _collapse_duplicate_turns(messages: list[Message]) -> list[Message]:
-    """Final pass: merge adjacent/same-speaker near-duplicates after cleanup."""
-    if len(messages) < 2:
-        return messages
-    return _dedupe_messages(messages)
-
-
-def _message_fingerprint(text: str) -> str:
-    return _normalize_for_dedupe(text)[:280]
-
-
-def _merge_dom_windows(windows: list[list[Message]]) -> list[Message]:
-    """Merge virtualized DOM scrapes into one timeline.
-
-    Poe recycles message nodes while scrolling: a bottom scrape has the newest
-    turns, a top scrape has the oldest. Replacing with the longest window drops
-    whichever end scrolled out of view — bad after you continue a long chat.
-    """
-    usable = [
-        [m for m in w if m.text and not _looks_like_ui_chrome(m.text)]
-        for w in windows
-        if w
-    ]
-    usable = [w for w in usable if w]
-    if not usable:
+    if not code:
         return []
-    if len(usable) == 1:
-        return list(usable[0])
-
-    def _find_match(msg: Message, pool: list[Message]) -> int:
-        fp = _message_fingerprint(msg.text)
-        if not fp:
-            return -1
-        for i, prev in enumerate(pool):
-            if not _same_speaker(prev.author, msg.author):
-                continue
-            if (
-                _message_fingerprint(prev.text) == fp
-                or _overlap_score(prev.text, msg.text) >= 0.5
-            ):
-                return i
-        return -1
-
-    # windows[0] ≈ initial bottom (newest); later ≈ after scrolling up (older).
-    # Walk oldest → newest: keep the oldest window, then append only the
-    # suffix of each newer window that comes after the overlap.
-    ordered = list(reversed(usable))
-    result: list[Message] = list(ordered[0])
-
-    for window in ordered[1:]:
-        last_match_in_window = -1
-        for i, msg in enumerate(window):
-            idx = _find_match(msg, result)
-            if idx >= 0:
-                result[idx] = _prefer_message(result[idx], msg)
-                last_match_in_window = i
-        for msg in window[last_match_in_window + 1 :]:
-            if _find_match(msg, result) >= 0:
-                continue
-            result.append(msg)
-    return result
+    urls = [f"https://poe.com/chat/{code}"]
+    handle = (chat.bot_handle or "").strip().lstrip("@")
+    if handle:
+        urls.append(f"https://poe.com/{handle}/{code}")
+    return urls
 
 
-def _insert_message_by_time(result: list[Message], msg: Message) -> None:
-    """Insert msg into result using timestamps when possible."""
-    t = msg.creation_time_us
-    if t is None:
-        # Opening human prompt often lacks a stamp while the bot reply has one.
-        if _speaker_side(msg.author) == "human" and result:
-            if _speaker_side(result[0].author) == "bot":
-                result.insert(0, msg)
-                return
-        result.append(msg)
-        return
-    for i, existing in enumerate(result):
-        et = existing.creation_time_us
-        if et is not None and et > t:
-            result.insert(i, msg)
-            return
-    result.append(msg)
+@dataclass
+class NetworkCapture:
+    url: str
+    query_name: str | None
+    variables: dict[str, Any] | None
+    status: int
+    content_type: str
+    payloads: list[dict[str, Any]]
+    raw_body: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "url": self.url,
+            "queryName": self.query_name,
+            "variables": self.variables,
+            "status": self.status,
+            "contentType": self.content_type,
+            "payloads": self.payloads,
+        }
+        if self.raw_body is not None:
+            out["rawBody"] = self.raw_body
+        return out
 
 
-def _assemble_from_dom_and_network(
-    dom_msgs: list[Message],
-    network_msgs: list[Message],
-) -> list[Message]:
-    """Merge DOM + network. Prefer timed network order for multi-turn chats."""
-    dom_msgs = [
-        m for m in dom_msgs if m.text and not _looks_like_ui_chrome(m.text)
-    ]
-    network_msgs = _dedupe_messages(
-        [m for m in network_msgs if m.text and not _looks_like_ui_chrome(m.text)]
-    )
-    timed_net = [m for m in network_msgs if m.creation_time_us]
+@dataclass
+class HarvestResult:
+    messages: list[Message]
+    complete: bool | None
+    source: str  # raw | dom-fallback | none
+    counts: dict[str, int]
+    chat: ChatInfo | None
+    url: str
+    pages_loaded: int = 0
+    graphql_pages: int = 0
+    elapsed_s: float = 0.0
+    notes: list[str] = field(default_factory=list)
+    raw: dict[str, Any] | None = None
 
-    # Timed network history is the best backbone once a chat has several turns
-    # (continuing a thread often virtualizes the original prompt out of the DOM).
-    if len(timed_net) >= 2 and len(timed_net) >= max(2, len(dom_msgs) - 1):
-        backbone = _sort_messages(list(timed_net))
-        unused_dom = list(dom_msgs)
-        result: list[Message] = []
-        for net in backbone:
-            best_i = -1
-            best_score = 0.0
-            for i, dom in enumerate(unused_dom):
-                if not _same_speaker(dom.author, net.author):
-                    continue
-                score = _overlap_score(dom.text, net.text)
-                if score > best_score:
-                    best_score = score
-                    best_i = i
-            if best_i >= 0 and best_score >= 0.5:
-                dom = unused_dom.pop(best_i)
-                result.append(_prefer_message(net, dom))
-            else:
-                result.append(net)
-        for dom in unused_dom:
-            if any(
-                _same_speaker(dom.author, r.author)
-                and _overlap_score(dom.text, r.text) >= 0.5
-                for r in result
-            ):
-                continue
-            _insert_message_by_time(result, dom)
-        for net in network_msgs:
-            if net.creation_time_us:
-                continue
-            if any(
-                _same_speaker(net.author, r.author)
-                and _overlap_score(net.text, r.text) >= 0.5
-                for r in result
-            ):
-                continue
-            _insert_message_by_time(result, net)
-        return result
-
-    if not dom_msgs:
-        messages = list(network_msgs)
-        if any(m.creation_time_us for m in messages):
-            return _sort_messages(messages)
-        return messages
-
-    unused = list(network_msgs)
-    result = []
-    for dom in dom_msgs:
-        best_i = -1
-        best_score = 0.0
-        for i, net in enumerate(unused):
-            if not _same_speaker(dom.author, net.author):
-                continue
-            score = _overlap_score(dom.text, net.text)
-            if score > best_score:
-                best_score = score
-                best_i = i
-        if best_i >= 0 and best_score >= 0.5:
-            net = unused.pop(best_i)
-            result.append(_prefer_message(net, dom))
+    def summary(self) -> str:
+        sources = ", ".join(f"{k}={v}" for k, v in self.counts.items() if v)
+        if self.complete is True:
+            state = "complete"
+        elif self.complete is False:
+            state = "INCOMPLETE (older messages could not be loaded)"
         else:
-            result.append(dom)
-
-    for net in unused:
-        if any(
-            _same_speaker(net.author, r.author)
-            and _overlap_score(net.text, r.text) >= 0.5
-            for r in result
-        ):
-            continue
-        _insert_message_by_time(result, net)
-
-    return result
+            state = "completeness unknown"
+        if self.source == "dom-fallback":
+            state += ", DOM fallback (formatting may be lossy)"
+        text = f"{len(self.messages)} messages"
+        if sources:
+            text += f" ({sources})"
+        return f"{text}, {state}"
 
 
 class PoeClient:
-    """Poe GraphQL client via Playwright (Cloudflare + session cookies)."""
+    """A logged-in (or anonymous) Poe browser session driven by Playwright."""
 
     def __init__(
         self,
         playwright: Playwright,
-        token: str,
+        token: str | None,
         lat: str | None = None,
         headless: bool = True,
+        warmup: bool = True,
     ) -> None:
         self.browser = playwright.chromium.launch(
             headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
+        self.user_agent = self._detect_user_agent()
         self.context = self.browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
+            user_agent=self.user_agent,
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
         )
-        cookies: list[dict[str, Any]] = [
-            {
-                "name": "p-b",
-                "value": token,
-                "domain": "poe.com",
-                "path": "/",
-            }
-        ]
+        cookies: list[dict[str, Any]] = []
+        if token:
+            cookies.append({"name": "p-b", "value": token, "domain": "poe.com", "path": "/"})
         if lat:
-            cookies.append(
-                {
-                    "name": "p-lat",
-                    "value": lat,
-                    "domain": "poe.com",
-                    "path": "/",
-                }
-            )
-        self.context.add_cookies(cookies)
+            cookies.append({"name": "p-lat", "value": lat, "domain": "poe.com", "path": "/"})
+        if cookies:
+            self.context.add_cookies(cookies)
+        self.cookies = {c["name"]: c["value"] for c in cookies}
         self.page = self.context.new_page()
         self._headers: dict[str, str] | None = None
         self.formkey = ""
-        self._graphql_messages_ok = False
-
+        self._pagination_variables: dict[str, Any] | None = None
         self.page.on("request", self._on_request)
-        print("Loading poe.com…", file=sys.stderr)
-        self.page.goto(
-            "https://poe.com",
-            wait_until="domcontentloaded",
-            timeout=90_000,
-        )
-        try:
-            self.page.wait_for_load_state("load", timeout=30_000)
-        except Exception:
-            pass
+        if warmup:
+            self._warmup()
 
-        for _ in range(20):
+    def _detect_user_agent(self) -> str:
+        try:
+            probe = self.browser.new_context()
+            try:
+                ua = probe.new_page().evaluate("navigator.userAgent")
+            finally:
+                probe.close()
+            if ua:
+                return normalize_user_agent(ua)
+        except PlaywrightError:
+            pass
+        major = (self.browser.version or "0").split(".")[0]
+        return (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        )
+
+    def _warmup(self) -> None:
+        print("Loading poe.com…", file=sys.stderr)
+        self.page.goto("https://poe.com", wait_until="domcontentloaded", timeout=90_000)
+        if "/login" in self.page.url:
+            raise NotLoggedInError(
+                "Poe redirected to the login page: the p-b cookie is missing or expired. "
+                "Copy fresh p-b (and p-lat) values from your browser."
+            )
+        for _ in range(40):
             if self._headers and self.formkey:
                 break
-            self.page.wait_for_timeout(500)
-
+            self.page.wait_for_timeout(250)
         if self.formkey:
             print(f"Connected (formkey: {self.formkey[:8]}…)", file=sys.stderr)
         else:
             print(
-                "Warning: could not capture poe-formkey; GraphQL may fail. "
-                "Try: poe-bulk-export list --headed",
+                "Warning: could not capture poe-formkey; chat listing may fail. "
+                "Try again with --headed.",
                 file=sys.stderr,
             )
 
     def _on_request(self, request: Any) -> None:
         if "gql_POST" not in request.url:
             return
-
         headers = {
             k: v
             for k, v in request.headers.items()
@@ -684,6 +257,10 @@ class PoeClient:
             return
         if isinstance(payload, dict):
             _update_hash_from_payload(payload)
+            if payload.get("queryName") == "ChatListPaginationQuery" and isinstance(
+                payload.get("variables"), dict
+            ):
+                self._pagination_variables = dict(payload["variables"])
 
         tag = request.headers.get("poe-tag-id")
         formkey = request.headers.get("poe-formkey") or self.formkey
@@ -692,6 +269,10 @@ class PoeClient:
 
     def close(self) -> None:
         self.browser.close()
+
+    # ------------------------------------------------------------------ #
+    # GraphQL
+    # ------------------------------------------------------------------ #
 
     def gql_request(
         self,
@@ -714,7 +295,7 @@ class PoeClient:
         attempt = 0
         while True:
             attempt += 1
-            result = self.page.evaluate(
+            result = self._safe_evaluate(
                 """async ([payloadStr, headers]) => {
                     const resp = await fetch("/api/gql_POST", {
                         method: "POST",
@@ -722,41 +303,42 @@ class PoeClient:
                         body: payloadStr,
                         credentials: "include",
                     });
-                    return {status: resp.status, body: await resp.text()};
+                    return {
+                        status: resp.status,
+                        contentType: resp.headers.get("content-type") || "",
+                        body: await resp.text(),
+                    };
                 }""",
                 [payload_str, headers],
             )
-
             status = result["status"]
             body = result["body"]
 
             if status == 429:
                 wait = min(30, 5 * attempt)
-                print(
-                    f"Rate limited on {query_name}; waiting {wait}s…",
-                    file=sys.stderr,
-                )
+                print(f"Rate limited on {query_name}; waiting {wait}s…", file=sys.stderr)
                 time.sleep(wait)
                 if attempt <= retries:
                     continue
                 raise RuntimeError(f"Rate limited after {retries} retries")
-
             if status in (502, 503, 504) and attempt <= retries:
                 time.sleep(2 * attempt)
                 continue
-
             if status != 200:
                 raise RuntimeError(
                     f"Request failed ({status}) for {query_name}: "
                     f"{body[:400] if body else '(empty body)'}"
                 )
 
-            data = json.loads(body)
-            if "errors" in data:
+            payloads = parse_graphql_body(body, result.get("contentType"))
+            if not payloads:
+                raise RuntimeError(f"Unreadable response for {query_name}: {body[:200]!r}")
+            data = payloads[0]
+            if data.get("errors") and not data.get("data"):
                 err_text = json.dumps(data["errors"])
                 if "PersistedQueryNotFound" in err_text:
                     raise RuntimeError(
-                        f"PersistedQueryNotFound for {query_name}."
+                        f"PersistedQueryNotFound for {query_name}: Poe changed this query's hash."
                     )
                 if attempt <= retries and any(
                     x in err_text.lower() for x in ("rate", "limit", "throttle")
@@ -764,18 +346,20 @@ class PoeClient:
                     time.sleep(5 * attempt)
                     continue
                 raise RuntimeError(f"GraphQL errors: {err_text}")
-
             return data
 
+    # ------------------------------------------------------------------ #
+    # Page helpers
+    # ------------------------------------------------------------------ #
+
     def _wait_for_navigation_settle(self, quiet_ms: int = 800, timeout_ms: int = 20_000) -> None:
-        """Wait until the page URL/load stops changing (Poe often redirects /c → bot URL)."""
         deadline = time.time() + timeout_ms / 1000
         last = self.page.url
         stable_since = time.time()
         while time.time() < deadline:
             try:
                 self.page.wait_for_load_state("domcontentloaded", timeout=3_000)
-            except Exception:
+            except PlaywrightError:
                 pass
             self.page.wait_for_timeout(200)
             current = self.page.url
@@ -794,7 +378,7 @@ class PoeClient:
                 if arg is None:
                     return self.page.evaluate(expression)
                 return self.page.evaluate(expression, arg)
-            except Exception as exc:  # noqa: BLE001
+            except PlaywrightError as exc:
                 last_exc = exc
                 msg = str(exc).lower()
                 if "context was destroyed" in msg or "navigation" in msg:
@@ -805,427 +389,433 @@ class PoeClient:
             raise last_exc
         return None
 
-    def _scroll_chat_up(self) -> None:
-        """Scroll toward older messages without relying on a fragile evaluate."""
+    def _probe(self, target: ChatTarget) -> dict[str, Any]:
         try:
-            self.page.keyboard.press("Home")
-        except Exception:
-            pass
-        try:
-            self.page.mouse.wheel(0, -4000)
-        except Exception:
-            pass
-        try:
-            self._safe_evaluate(
-                """() => {
-                    const nodes = Array.from(document.querySelectorAll('*'));
-                    let best = document.scrollingElement;
-                    let bestOverflow = 0;
-                    for (const el of nodes) {
-                      const style = getComputedStyle(el);
-                      const oy = style.overflowY;
-                      if ((oy === 'auto' || oy === 'scroll') &&
-                          el.scrollHeight > el.clientHeight + 50) {
-                        const score = el.scrollHeight - el.clientHeight;
-                        if (score > bestOverflow) {
-                          bestOverflow = score;
-                          best = el;
-                        }
-                      }
-                    }
-                    if (best) best.scrollTop = 0;
-                    window.scrollTo(0, 0);
-                }"""
-            )
-        except Exception:
-            # Scroll is best-effort; message harvest still uses network events.
-            pass
+            return self._safe_evaluate(page_scripts.PROBE_JS, target.as_js()) or {}
+        except PlaywrightError:
+            return {}
 
-    def _scrape_dom_messages(self) -> tuple[list[Message], dict[str, Any]]:
-        """Read visible chat bubbles from the DOM (works even when gql harvest is empty)."""
-        info = self._safe_evaluate(
-            """() => {
-              const messages = [];
-              const seen = new Set();
-              const chrome = new Set([
-                'thinking', 'thinking...', 'view all', 'run', 'copy', 'edited', 'regenerate'
-              ]);
-              const push = (author, text) => {
-                const t = (text || '').trim();
-                if (!t) return;
-                if (chrome.has(t.toLowerCase())) return;
-                // Skip tiny UI fragments
-                if (t.length < 3) return;
-                const key = author + '\\n' + t;
-                if (seen.has(key)) return;
-                seen.add(key);
-                messages.push({ author, text: t });
-              };
+    def _wait_until_ready(self, target: ChatTarget, *, timeout_s: float = 25.0) -> dict[str, Any]:
+        """Poll until the Relay store holds this chat's messages (or give up)."""
+        started = time.monotonic()
+        probe: dict[str, Any] = {}
+        while time.monotonic() - started < timeout_s:
+            probe = self._probe(target)
+            store = probe.get("store") or {}
+            if store.get("messageCount"):
+                return probe
+            elapsed = time.monotonic() - started
+            # No Relay environment, but server data is there: give hydration a moment.
+            if probe.get("hasNextData") and not probe.get("envFound") and elapsed > 8:
+                return probe
+            if probe.get("envFound") and elapsed > 12:
+                return probe
+            self.page.wait_for_timeout(250)
+        return probe
 
-              const containers = document.querySelectorAll(
-                '[class*="Markdown_markdownContainer"], [class*="Markdown_markdown"]'
-              );
-              for (const container of containers) {
-                let host = container;
-                let author = 'unknown';
-                // Walk ancestors for side / role class names (Poe MessageBubble)
-                for (let i = 0; i < 12 && host; i++) {
-                  const cls = String(host.className || '');
-                  if (/rightSide|RightSide|UserMessage|Outbound|fromUser/i.test(cls)) {
-                    author = 'human';
-                    break;
-                  }
-                  if (/leftSide|LeftSide|BotMessage|Inbound|fromBot/i.test(cls)) {
-                    author = 'bot';
-                    break;
-                  }
-                  if (/Message|Bubble|ChatMessage/i.test(cls) && host !== container) {
-                    // keep walking a bit more on the bubble for side classes
-                  }
-                  host = host.parentElement;
-                }
-                if (author === 'unknown') {
-                  const rect = container.getBoundingClientRect();
-                  const mid = window.innerWidth / 2;
-                  // User bubbles are typically on the right half
-                  author = rect.left >= mid * 0.55 ? 'human' : 'bot';
-                }
-                push(author, container.innerText || '');
-              }
+    # ------------------------------------------------------------------ #
+    # Harvest
+    # ------------------------------------------------------------------ #
 
-              if (messages.length === 0) {
-                // Broader fallback: any obvious message row text
-                const rows = document.querySelectorAll(
-                  '[class*="Message_row"], [class*="ChatMessage"], [data-testid*="message"]'
-                );
-                for (const row of rows) {
-                  const text = (row.innerText || '').trim();
-                  if (text) push('unknown', text);
-                }
-              }
-
-              const bodyText = (document.body && document.body.innerText) || '';
-              return {
-                title: document.title || '',
-                url: location.href,
-                messageCount: messages.length,
-                messages,
-                bodySample: bodyText.slice(0, 400),
-                looksLikeLogin: /log\\s*in|sign\\s*in|create account/i.test(bodyText.slice(0, 2000)),
-              };
-            }"""
-        ) or {}
-
-        messages = [
-            Message(
-                author=m.get("author") or "unknown",
-                text=m.get("text") or "",
-                source="dom",
-            )
-            for m in (info.get("messages") or [])
-            if m.get("text")
-        ]
-        return messages, info
-
-    def _merge_message(self, store: dict[Any, Message], msg: Message) -> None:
-        key: Any
-        if msg.message_id is not None:
-            key = ("id", msg.message_id)
-        else:
-            key = ("text", msg.author, (msg.text or "")[:240])
-        prev = store.get(key)
-        if prev is None:
-            store[key] = msg
-        else:
-            store[key] = _prefer_message(prev, msg)
-
-    def harvest_chat_messages(
+    def harvest(
         self,
-        chat: Chat,
+        target: ChatTarget,
+        urls: list[str],
         *,
-        scroll_pages: int = 25,
-        include_thinking: bool = False,
-    ) -> list[Message]:
-        """Open the chat page; merge scrolled DOM windows + network JSON."""
-        network_by_key: dict[Any, Message] = {}
-        dom_windows: list[list[Message]] = []
-        api_hits = 0
-        network_count = 0
+        max_pages: int = 200,
+        capture_raw: bool = False,
+        log: Log | None = None,
+    ) -> HarvestResult:
+        """Open a chat page and return its messages exactly as Poe stores them."""
+        log = log or (lambda _msg: None)
+        started = time.monotonic()
+        captures: list[NetworkCapture] = []
+        notes: list[str] = []
 
         def on_response(response: Any) -> None:
-            nonlocal api_hits, network_count
-            url = response.url
-            if "poe.com" not in url:
-                return
-            if not any(x in url for x in ("/api/", "gql", "graphql")):
-                return
-            api_hits += 1
-            try:
-                data = response.json()
-            except Exception:
-                return
-            for node in _walk_message_nodes(data):
-                network_count += 1
-                self._merge_message(network_by_key, _message_from_node(node))
+            capture = self._capture_response(response, keep_raw=capture_raw)
+            if capture is not None:
+                captures.append(capture)
 
         self.page.on("response", on_response)
-        page_info: dict[str, Any] = {}
         try:
-            opened = False
-            for url in _chat_urls(chat):
-                print(f"Opening {url}", file=sys.stderr)
-                try:
-                    self.page.goto(url, wait_until="commit", timeout=90_000)
-                except Exception as exc:
-                    print(f"  navigation error: {exc}", file=sys.stderr)
-                    continue
-                self._wait_for_navigation_settle()
-                try:
-                    self.page.wait_for_load_state("load", timeout=20_000)
-                except Exception:
-                    pass
-                self.page.wait_for_timeout(3500)
-                self._wait_for_navigation_settle()
-                print(f"  landed on {self.page.url}", file=sys.stderr)
-                opened = True
+            probe = self._open(target, urls, log)
+            final_url = self.page.url
 
-                # Capture the newest-end window first (bottom of chat).
-                dom_msgs, page_info = self._scrape_dom_messages()
-                if dom_msgs:
-                    dom_windows.append(dom_msgs)
-                if network_by_key or dom_windows:
-                    break
-                if api_hits > 0:
-                    break
+            next_data = self._safe_evaluate(page_scripts.NEXT_DATA_JS)
+            next_ex = extract_from_next_data(next_data, target)
+            target = target.enriched(next_ex.chat)
 
-            if not opened:
-                print("Could not open any chat URL", file=sys.stderr)
-                return []
-
-            stable_rounds = 0
-            for i in range(scroll_pages):
-                before_net = len(network_by_key)
-                before_merged = len(_merge_dom_windows(dom_windows))
-                before_nodes = network_count
-                self._scroll_chat_up()
-                self.page.wait_for_timeout(1200)
-                dom_msgs, page_info = self._scrape_dom_messages()
-                if dom_msgs:
-                    dom_windows.append(dom_msgs)
-                merged_count = len(_merge_dom_windows(dom_windows))
-                if (
-                    len(network_by_key) == before_net
-                    and merged_count == before_merged
-                    and network_count == before_nodes
-                ):
-                    self.page.wait_for_timeout(1500)
-                    dom_msgs, page_info = self._scrape_dom_messages()
-                    if dom_msgs:
-                        dom_windows.append(dom_msgs)
-                    merged_count = len(_merge_dom_windows(dom_windows))
-                    if (
-                        len(network_by_key) == before_net
-                        and merged_count == before_merged
-                    ):
-                        stable_rounds += 1
-                        if stable_rounds >= 2 and i > 2:
-                            break
-                    else:
-                        stable_rounds = 0
-                else:
-                    stable_rounds = 0
-
-            dom_ordered = _merge_dom_windows(dom_windows)
-            print(
-                f"Harvested network={len(network_by_key)} "
-                f"dom={len(dom_ordered)} windows={len(dom_windows)} "
-                f"(api responses={api_hits}, network_nodes={network_count}, "
-                f"dom_scrape={page_info.get('messageCount', 0)}) "
-                f"at {self.page.url}",
-                file=sys.stderr,
-            )
-            if not network_by_key and not dom_ordered:
-                sample = (page_info.get("bodySample") or "").replace("\n", " ")[:200]
-                print(
-                    f"Page debug: title={page_info.get('title')!r} "
-                    f"login={page_info.get('looksLikeLogin')} sample={sample!r}",
-                    file=sys.stderr,
+            store_status = probe.get("store") or {}
+            page_info = PageInfo.from_dict(store_status.get("pageInfo")) or next_ex.page_info
+            pages_loaded = 0
+            scroll_log: list[dict[str, Any]] = []
+            if probe.get("envFound") and (page_info is None or page_info.has_previous_page):
+                pages_loaded, scroll_log = self._load_older_by_scrolling(
+                    target, page_info, max_pages=max_pages, log=log
                 )
-                if page_info.get("looksLikeLogin"):
-                    print(
-                        "Chat page looks logged out. Re-copy p-b and also set "
-                        "POE_LAT from Cookies, then retry with --headed.",
-                        file=sys.stderr,
+
+            snapshot = self._safe_evaluate(page_scripts.SNAPSHOT_JS, target.as_js()) or {}
+            store_ex = extract_from_relay_records(snapshot.get("records"), target)
+            target = target.enriched(store_ex.chat)
+
+            network_ex = combine_extractions(
+                [
+                    extract_from_graphql(c.payloads, target, variables=c.variables)
+                    for c in captures
+                ],
+                page_info="oldest",
+            )
+
+            page_info = store_ex.page_info or network_ex.page_info or next_ex.page_info
+            graphql_ex = Extraction()
+            graphql_pages = 0
+            if page_info is not None and page_info.has_previous_page:
+                cursor = _oldest_cursor(page_info, network_ex)
+                if target.node_id and cursor:
+                    log("scrolling stopped early; fetching older pages over GraphQL")
+                    try:
+                        graphql_ex, graphql_pages = self._load_older_via_graphql(
+                            target, cursor, max_pages=max_pages
+                        )
+                        if graphql_ex.page_info is not None:
+                            page_info = graphql_ex.page_info
+                    except Exception as exc:  # noqa: BLE001 - the chat is still reported as incomplete
+                        notes.append(f"GraphQL pagination failed: {exc}")
+
+            merged = combine_extractions([store_ex, network_ex, graphql_ex, next_ex])
+            chat_info = merged.chat
+            if chat_info is None or not chat_info.title:
+                # The sidebar chat list (page data or network) also carries the title.
+                for data in [next_data, *(c.payloads for c in captures)]:
+                    found = find_chat_info(data, target)
+                    if found is not None:
+                        chat_info = found if chat_info is None else chat_info.merged(found)
+                        break
+
+            counts = {
+                "store": len(store_ex.messages),
+                "next_data": len(next_ex.messages),
+                "network": len(network_ex.messages),
+                "graphql": len(graphql_ex.messages),
+            }
+            messages = merged.messages
+            source = "raw"
+            if page_info is None:
+                complete = None if messages else False
+            else:
+                complete = page_info.has_more is False
+
+            if not messages:
+                source = "none"
+                if _url_matches_target(final_url, target):
+                    dom_messages = messages_from_dom(
+                        self._safe_evaluate(page_scripts.DOM_MESSAGES_JS) or []
                     )
+                    counts["dom"] = len(dom_messages)
+                    if dom_messages:
+                        messages = dom_messages
+                        source = "dom-fallback"
+                        complete = None
+                        notes.append("no raw message data on the page; converted rendered HTML instead")
+                if not messages:
+                    complete = False
+                    notes.append(
+                        f"no messages found at {final_url} "
+                        f"(title={probe.get('title')!r}, relay store found={probe.get('envFound')})"
+                    )
+
+            raw = None
+            if capture_raw:
+                raw = {
+                    "final_url": final_url,
+                    "probe": probe,
+                    "next_data": next_data,
+                    "store": snapshot,
+                    "network": [c.to_dict() for c in captures],
+                    "scroll_log": scroll_log,
+                    "dom_html": self._safe_evaluate(page_scripts.DOM_SNAPSHOT_JS),
+                }
+
+            return HarvestResult(
+                messages=messages,
+                complete=complete,
+                source=source,
+                counts=counts,
+                chat=chat_info,
+                url=final_url,
+                pages_loaded=pages_loaded,
+                graphql_pages=graphql_pages,
+                elapsed_s=time.monotonic() - started,
+                notes=notes,
+                raw=raw,
+            )
         finally:
             self.page.remove_listener("response", on_response)
 
-        assembled = _assemble_from_dom_and_network(
-            dom_ordered, list(network_by_key.values())
+    def _open(self, target: ChatTarget, urls: list[str], log: Log) -> dict[str, Any]:
+        probe: dict[str, Any] = {}
+        for url in urls:
+            log(f"opening {url}")
+            try:
+                response = self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+            except PlaywrightError as exc:
+                log(f"navigation error: {exc}")
+                continue
+            if "/login" in self.page.url:
+                raise NotLoggedInError(
+                    "Poe redirected to the login page: the p-b cookie is missing or expired."
+                )
+            probe = self._wait_until_ready(target)
+            store = probe.get("store") or {}
+            log(
+                f"landed on {self.page.url} (relay store={probe.get('envFound')}, "
+                f"messages={store.get('messageCount', 0)}, __NEXT_DATA__={probe.get('hasNextData')})"
+            )
+            if store.get("messageCount") or (response is not None and response.status < 400):
+                return probe
+        return probe
+
+    def _capture_response(self, response: Any, *, keep_raw: bool) -> NetworkCapture | None:
+        url = response.url
+        if "poe.com" not in url or "gql" not in url.lower():
+            return None
+        try:
+            request = response.request
+            query_name, variables = _query_meta(request.post_data, request.headers)
+            body = response.body()
+        except Exception:  # noqa: BLE001 - an event handler must never raise
+            return None
+        content_type = response.headers.get("content-type", "")
+        payloads = parse_graphql_body(body, content_type)
+        raw_body = body.decode("utf-8", "replace") if keep_raw and not payloads else None
+        return NetworkCapture(
+            url=url,
+            query_name=query_name,
+            variables=variables,
+            status=response.status,
+            content_type=content_type,
+            payloads=payloads,
+            raw_body=raw_body,
         )
-        messages = _dedupe_messages(assembled)
-        # Only chronologically sort when every turn has a timestamp — otherwise
-        # preserve DOM document order (network-only stamps would shove the
-        # bot reply above an untimed user prompt).
-        if messages and all(m.creation_time_us for m in messages):
-            messages = _sort_messages(messages)
-        cleaned = cleanup_messages(
-            messages,
-            include_thinking=include_thinking,
-            bot_name=chat.bot,
-            bot_handle=chat.bot_handle,
-        )
-        # Fence repair can make DOM/network copies comparable only after cleanup.
-        return _collapse_duplicate_turns(cleaned)
+
+    def _scroll_to_oldest(self) -> dict[str, Any]:
+        info = self._safe_evaluate(page_scripts.SCROLL_TO_OLDEST_JS) or {}
+        if info.get("x") is not None and info.get("y") is not None:
+            try:
+                self.page.mouse.move(info["x"], info["y"])
+                for _ in range(3):
+                    self.page.mouse.wheel(0, -2400)
+            except PlaywrightError:
+                pass
+        return info
+
+    def _load_older_by_scrolling(
+        self,
+        target: ChatTarget,
+        page_info: PageInfo | None,
+        *,
+        max_pages: int,
+        log: Log,
+        wait_s: float = 6.0,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Scroll to the top until the store says there is no previous page.
+
+        The page sends its own signed pagination requests, so no GraphQL
+        details have to be guessed. Gives up after two rounds without progress.
+        """
+        count = int(((self._probe(target).get("store")) or {}).get("messageCount") or 0)
+        loaded = 0
+        stale = 0
+        scroll_log: list[dict[str, Any]] = []
+        for _ in range(max_pages):
+            if page_info is not None and not page_info.has_previous_page:
+                break
+            scroll = self._scroll_to_oldest()
+            started = time.monotonic()
+            nudged = False
+            new_count = count
+            while time.monotonic() - started < wait_s:
+                self.page.wait_for_timeout(300)
+                store = self._probe(target).get("store") or {}
+                new_count = int(store.get("messageCount") or 0)
+                page_info = PageInfo.from_dict(store.get("pageInfo")) or page_info
+                if new_count > count or (page_info is not None and not page_info.has_previous_page):
+                    break
+                if not nudged and time.monotonic() - started > wait_s / 2:
+                    # Infinite-scroll sentinels sometimes need a second scroll event.
+                    self._scroll_to_oldest()
+                    nudged = True
+            scroll_log.append(
+                {
+                    "before": count,
+                    "after": new_count,
+                    "scroll": scroll,
+                    "pageInfo": asdict(page_info) if page_info else None,
+                }
+            )
+            if new_count > count:
+                loaded += 1
+                stale = 0
+                log(f"loaded older messages: {count} -> {new_count}")
+                count = new_count
+            else:
+                stale += 1
+                if stale >= 2:
+                    break
+        return loaded, scroll_log
+
+    def _load_older_via_graphql(
+        self,
+        target: ChatTarget,
+        cursor: str,
+        *,
+        max_pages: int,
+    ) -> tuple[Extraction, int]:
+        """Page backwards with the same signed query the page itself uses."""
+        template = dict(self._pagination_variables or {"count": 50})
+        parts: list[Extraction] = []
+        seen: set[str] = set()
+        pages = 0
+        while cursor and cursor not in seen and pages < max_pages:
+            seen.add(cursor)
+            variables = {**template, "cursor": cursor, "id": target.node_id}
+            data = self.gql_request("ChatListPaginationQuery", variables)
+            part = extract_from_graphql([data], target, variables=variables, source="graphql")
+            parts.append(part)
+            pages += 1
+            info = part.page_info
+            if not part.messages or info is None or not info.has_previous_page:
+                break
+            cursor = info.start_cursor or ""
+        return combine_extractions(parts, page_info="oldest"), pages
+
+
+def _oldest_cursor(page_info: PageInfo, network: Extraction) -> str | None:
+    if network.page_info is not None and network.page_info.start_cursor:
+        return network.page_info.start_cursor
+    return page_info.start_cursor
+
+
+def _url_matches_target(url: str, target: ChatTarget) -> bool:
+    codes = [c for c in (target.chat_code, target.share_code) if c]
+    return not codes or any(code in (url or "") for code in codes)
+
+
+def harvest_chat(
+    client: PoeClient,
+    chat: Chat,
+    *,
+    max_pages: int = 200,
+    capture_raw: bool = False,
+    log: Log | None = None,
+) -> HarvestResult:
+    target = ChatTarget(
+        chat_code=chat.chat_code or None,
+        chat_id=chat.chat_id,
+        node_id=chat.node_id or None,
+    )
+    return client.harvest(
+        target,
+        _chat_urls(chat),
+        max_pages=max_pages,
+        capture_raw=capture_raw,
+        log=log,
+    )
+
+
+_ACTIVITY_KEYS = (
+    "lastInteractionTime",
+    "lastMessageTime",
+    "lastMessageCreationTime",
+    "lastActivityTime",
+    "updatedTime",
+    "updatedAt",
+)
+_LAST_MESSAGE_KEYS = ("lastMessage", "latestMessage", "newestMessage")
+
+
+def _activity_signature(node: dict[str, Any]) -> str | None:
+    """A value that changes whenever the chat gets a new message, if Poe sends one."""
+    for key in _ACTIVITY_KEYS:
+        if node.get(key) not in (None, ""):
+            return f"{key}={node[key]}"
+    for key in _LAST_MESSAGE_KEYS:
+        nested = node.get(key)
+        if isinstance(nested, dict):
+            marker = nested.get("messageId") or nested.get("creationTime")
+            if marker not in (None, ""):
+                return f"{key}={marker}"
+    return None
+
+
+def _activity_time_us(node: dict[str, Any]) -> int | None:
+    for key in _ACTIVITY_KEYS:
+        value = coerce_poe_time_us(node.get(key))
+        if value is not None:
+            return value
+    for key in _LAST_MESSAGE_KEYS:
+        nested = node.get(key)
+        if isinstance(nested, dict):
+            value = coerce_poe_time_us(nested.get("creationTime"))
+            if value is not None:
+                return value
+    return None
+
+
+def chat_from_list_node(node: dict[str, Any]) -> Chat:
+    bot_obj = node.get("defaultBotObject") or {}
+    handle = bot_obj.get("handle") or bot_obj.get("nickname") or node.get("defaultBotNickname") or ""
+    return Chat(
+        chat_id=node.get("chatId"),
+        chat_code=node.get("chatCode") or "",
+        node_id=node.get("id") or "",
+        title=node.get("title") or "Untitled",
+        bot=bot_obj.get("displayName") or handle or "",
+        bot_handle=str(handle or ""),
+        activity_time_us=_activity_time_us(node),
+        created_time_us=coerce_poe_time_us(node.get("creationTime")),
+        activity_signature=_activity_signature(node),
+    )
 
 
 def list_chats(client: PoeClient, limit: int | None = None) -> list[Chat]:
     chats: list[Chat] = []
     cursor: str | None = None
-
     while True:
         variables: dict[str, Any] = {"count": 50}
         if cursor:
             variables["cursor"] = cursor
-
         data = client.gql_request("ChatHistoryListPaginationQuery", variables)
         chats_data = data["data"]["chats"]
-        edges = chats_data.get("edges") or []
-        page_info = chats_data.get("pageInfo") or {}
-
-        for edge in edges:
+        for edge in chats_data.get("edges") or []:
             node = edge.get("node") or {}
-            bot_obj = node.get("defaultBotObject") or {}
-            handle = (
-                bot_obj.get("handle")
-                or bot_obj.get("nickname")
-                or node.get("defaultBotNickname")
-                or ""
-            )
-            activity = _node_time_us(node)
-            # Some list payloads nest the latest message time
-            if activity is None:
-                for nested_key in ("lastMessage", "newestMessage", "latestMessage"):
-                    nested = node.get(nested_key)
-                    if isinstance(nested, dict):
-                        activity = _node_time_us(nested)
-                        if activity is not None:
-                            break
-            chats.append(
-                Chat(
-                    chat_id=node.get("chatId"),
-                    chat_code=node.get("chatCode") or "",
-                    node_id=node["id"],
-                    title=node.get("title") or "Untitled",
-                    bot=(
-                        bot_obj.get("displayName")
-                        or handle
-                        or "unknown"
-                    ),
-                    bot_handle=str(handle or ""),
-                    activity_time_us=activity,
-                )
-            )
+            if not node.get("chatCode"):
+                continue
+            chats.append(chat_from_list_node(node))
             if limit is not None and len(chats) >= limit:
                 return chats
-
-        if not page_info.get("hasNextPage"):
-            break
+        page_info = chats_data.get("pageInfo") or {}
         cursor = page_info.get("endCursor")
-        if not cursor:
+        if not page_info.get("hasNextPage") or not cursor:
             break
-
     return chats
 
 
-def _fetch_messages_graphql(
-    client: PoeClient,
-    chat: Chat,
-    *,
-    include_thinking: bool = False,
-) -> list[Message]:
-    batches: list[list[Message]] = []
-    cursor: str | None = None
-
-    while True:
-        variables: dict[str, Any] = {
-            "count": 100,
-            "id": chat.node_id,
-        }
-        if cursor is not None:
-            variables["cursor"] = cursor
-
-        data = client.gql_request("ChatListPaginationQuery", variables)
-        chat_data = data["data"]["node"]
-        msg_conn = chat_data["messagesConnection"]
-        edges = msg_conn.get("edges") or []
-        page_info = msg_conn.get("pageInfo") or {}
-
-        page_messages = [
-            _message_from_node(edge.get("node") or {}) for edge in reversed(edges)
-        ]
-        batches.append(page_messages)
-
-        if not page_info.get("hasNextPage"):
-            break
-        cursor = page_info.get("startCursor")
-        if not cursor:
-            break
-
-    messages: list[Message] = []
-    for batch in reversed(batches):
-        messages.extend(batch)
-    cleaned = cleanup_messages(
-        messages,
-        include_thinking=include_thinking,
-        bot_name=chat.bot,
-        bot_handle=chat.bot_handle,
-    )
-    return _collapse_duplicate_turns(_dedupe_messages(cleaned))
-
-
-def fetch_messages(
-    client: PoeClient,
-    chat: Chat,
-    *,
-    include_thinking: bool = False,
-) -> list[Message]:
-    """Always prefer page harvest; GraphQL only if the page yields nothing."""
-    messages = client.harvest_chat_messages(
-        chat, include_thinking=include_thinking
-    )
-    if messages:
-        return messages
-
-    try:
-        messages = _fetch_messages_graphql(
-            client, chat, include_thinking=include_thinking
-        )
-        if messages:
-            client._graphql_messages_ok = True
-            return messages
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f"No messages harvested for '{chat.title}' "
-            f"(code={chat.chat_code}, handle={chat.bot_handle or '?'}). "
-            f"GraphQL also failed: {exc}"
-        ) from exc
-
-    raise RuntimeError(
-        f"No messages found for '{chat.title}' "
-        f"(code={chat.chat_code}). Try --headed and confirm the chat opens."
-    )
-
-
 def open_client(
-    token: str,
+    token: str | None,
     lat: str | None = None,
     headless: bool = True,
+    warmup: bool = True,
 ):
     class _Ctx:
         def __enter__(self):
             self._pw = sync_playwright().start()
-            self.client = PoeClient(self._pw, token, lat=lat, headless=headless)
+            try:
+                self.client = PoeClient(self._pw, token, lat=lat, headless=headless, warmup=warmup)
+            except BaseException:
+                self._pw.stop()
+                raise
             return self.client
 
         def __exit__(self, exc_type, exc, tb):
