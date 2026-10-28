@@ -21,6 +21,54 @@ def sanitize_filename(name: str, max_len: int = 180) -> str:
     return cleaned[:max_len]
 
 
+def sanitize_filename_component(name: str, max_len: int = 80) -> str:
+    """Filename-safe component: invalid chars + spaces → underscores."""
+    cleaned = _INVALID_FS.sub("_", name or "")
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    cleaned = cleaned.strip("._ ") or "Untitled"
+    return cleaned[:max_len]
+
+
+def earliest_message_date(messages: list) -> str:
+    """Return YYYY-MM-DD (UTC) from the earliest message timestamp, else undated."""
+    times: list[int] = []
+    for msg in messages or []:
+        raw = getattr(msg, "creation_time_us", None)
+        if raw is None and isinstance(msg, dict):
+            raw = msg.get("creation_time_us") or msg.get("time_epoch_us")
+        if raw is None or raw == "":
+            continue
+        try:
+            times.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not times:
+        return "undated"
+    try:
+        dt = datetime.fromtimestamp(min(times) / 1_000_000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except (OSError, OverflowError, ValueError):
+        return "undated"
+
+
+def chat_export_stem(
+    *,
+    title: str,
+    bot: str,
+    messages: list | None = None,
+    chat_code: str = "",
+) -> str:
+    """Informative stem: {date}_{model}_{title}[__{chat_code}]."""
+    date = earliest_message_date(messages or [])
+    model = sanitize_filename_component(bot or "unknown", max_len=48)
+    title_part = sanitize_filename_component(title or "Untitled", max_len=80)
+    stem = f"{date}_{model}_{title_part}"
+    if chat_code:
+        stem = f"{stem}__{sanitize_filename_component(chat_code, max_len=24)}"
+    return sanitize_filename_component(stem, max_len=180)
+
+
 def unique_path(directory: Path, stem: str, suffix: str) -> Path:
     """Return directory/stem.suffix, adding -2, -3, ... on collision."""
     candidate = directory / f"{stem}{suffix}"

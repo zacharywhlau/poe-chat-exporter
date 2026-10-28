@@ -88,6 +88,11 @@ poe-bulk-export export -t 'your_p-b_value'
 
 Chat pages use `https://poe.com/chat/{code}` (not `/c/`, which often 404s). Exports prefer network message JSON over truncated DOM panes, label You/User vs bot, and strip thinking unless `--include-thinking` is set.
 
+Files are named `{YYYY-MM-DD}_{model}_{title}__{chatCode}.md` using the earliest message date (UTC), for example:
+
+`2024-07-09_Claude-Fable-5_Python_Learning_Project__93ozu1d1q42v5qtcou.md`
+
+
 ## How it works
 
 1. Launches headless Chromium with your `p-b` cookie.

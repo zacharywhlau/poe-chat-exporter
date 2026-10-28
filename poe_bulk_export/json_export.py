@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from poe_bulk_export.models import Chat
-from poe_bulk_export.util import epoch_us_to_iso, now_iso, sanitize_filename, unique_path
+from poe_bulk_export.util import chat_export_stem, epoch_us_to_iso, now_iso, unique_path
 
 
 def chat_to_export_dict(chat: Chat) -> dict:
@@ -39,9 +39,12 @@ def chat_to_export_dict(chat: Chat) -> dict:
 
 def write_json(chat: Chat, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = sanitize_filename(chat.title)
-    if chat.chat_code:
-        stem = f"{stem}__{sanitize_filename(chat.chat_code, max_len=40)}"
+    stem = chat_export_stem(
+        title=chat.title,
+        bot=chat.bot,
+        messages=chat.messages,
+        chat_code=chat.chat_code,
+    )
     path = unique_path(output_dir, stem, ".json")
     path.write_text(
         json.dumps(chat_to_export_dict(chat), indent=2, ensure_ascii=False) + "\n",
