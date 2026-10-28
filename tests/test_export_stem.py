@@ -34,12 +34,12 @@ def test_prefer_keeps_network_timestamp_when_dom_text_wins():
     )
     dom = Message(
         author="unknown",
-        text="short but much longer scraped copy from the DOM pane",
+        text="x" * 200,  # dramatically longer than network + 80
         source="dom",
     )
     merged = _prefer_message(network, dom)
     assert merged.creation_time_us == 1705312200000000
-    assert "longer scraped" in merged.text
+    assert len(merged.text) == 200
 
 
 
