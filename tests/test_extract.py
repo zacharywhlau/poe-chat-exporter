@@ -248,6 +248,38 @@ def test_message_normalization():
     assert message_from_node({"cursor": "1"}) is None
 
 
+def test_chat_page_roles_come_from_author_nickname():
+    # Private chat pages select `authorNickname`, `authorUser` and `bot` (not `author`/`authorBot`).
+    claude = {"handle": "Claude-Fable-5", "nickname": "claude_fable", "displayName": "Claude-Fable-5"}
+    exporter = {"handle": "export-chat", "nickname": "exportchat", "displayName": "export-chat"}
+    user = {"uid": 1, "fullName": "Ada", "handle": "ada"}
+
+    def node(mid, nickname, bot, author_user=None, **extra):
+        return {"messageId": mid, "authorNickname": nickname, "bot": bot, "authorUser": author_user,
+                "isChatAnnouncement": False, "text": f"m{mid}", **extra}
+
+    messages = [message_from_node(n) for n in (
+        node(1, "human", claude, user),
+        node(2, "claude_fable", claude),
+        node(3, "human", exporter, user),
+        node(4, "exportchat", exporter),
+        node(5, "chat_break", claude),
+        node(6, "command", claude),
+        node(7, "chat_announcement_bot", claude, isChatAnnouncement=True),
+    )]
+    assert [m.author for m in messages] == ["human", "bot", "human", "bot", "chat_break", "system", "system"]
+    assert [m.author_name for m in messages[:4]] == ["Ada", "Claude-Fable-5", "Ada", "export-chat"]
+    assert messages[3].author_raw == "exportchat"
+
+
+def test_role_falls_back_to_linked_author_records():
+    claude = {"handle": "Claude-Fable-5", "nickname": "claude_fable", "displayName": "Claude-Fable-5"}
+    assert message_from_node({"messageId": 1, "text": "q", "authorUser": {"uid": 1}, "bot": claude}).author == "human"
+    assert message_from_node({"messageId": 2, "text": "q", "authorBot": {"handle": "Human", "nickname": "human"}}).author == "human"
+    assert message_from_node({"messageId": 3, "text": "a", "authorUser": None, "bot": claude}).author == "bot"
+    assert message_from_node({"messageId": 4, "text": "?", "authorUser": None, "bot": None}).author == "unknown"
+
+
 def test_bot_label_fallbacks():
     default = ChatInfo(bot_name="Claude-Fable-5", bot_nickname="claude_fable_5")
     resolved = {"messageId": 1, "author": "gpt_5", "text": "x", "authorBot": {"handle": "GPT-5"}}

@@ -456,8 +456,8 @@ def message_from_node(
     if "messageId" not in node and "text" not in node:
         return None
 
-    raw_author = _opt_str(node.get("author")) or ""
-    role = _role(raw_author, node)
+    raw_author = _raw_author(node)
+    role = _role(raw_author, node, deref)
     text = node.get("text")
     text = text if isinstance(text, str) else ""
 
@@ -610,17 +610,44 @@ def _chat_info(owner: dict[str, Any], deref: Deref) -> ChatInfo:
     )
 
 
-def _role(raw_author: str, node: dict[str, Any]) -> str:
-    author = raw_author.strip().lower()
+def _raw_author(node: dict[str, Any]) -> str:
+    # Chat pages select `authorNickname`; share pages select `author`.
+    return _opt_str(node.get("authorNickname")) or _opt_str(node.get("author")) or ""
+
+
+def _role(raw_author: str, node: dict[str, Any], deref: Deref) -> str:
+    """Poe's own rule (its ``messageHelpers``): the author nickname decides.
+
+    Every nickname other than ``human``, ``chat_break`` and ``command`` is a
+    bot. Without a nickname, fall back to the linked author records.
+    """
     if node.get("isChatAnnouncement") is True:
         return "system"
+    author = raw_author.strip().lower()
     if author == "human":
         return "human"
     if author in ("chat_break", "chatbreak"):
         return "chat_break"
-    if not author:
-        return "bot" if node.get("authorBot") else "unknown"
-    return "bot"
+    if author == "command":
+        return "system"
+    if author:
+        return "bot"
+    if isinstance(deref(node.get("authorUser")), dict):
+        return "human"
+    for key in ("authorBot", "bot"):
+        bot = deref(node.get(key))
+        if isinstance(bot, dict):
+            return "human" if _is_human_pseudo_bot(bot) else "bot"
+        if node.get(key):
+            return "bot"
+    return "unknown"
+
+
+def _is_human_pseudo_bot(bot: dict[str, Any]) -> bool:
+    # Share pages link human messages to a "Human" bot record.
+    return (_opt_str(bot.get("nickname")) or "").lower() == "human" or (
+        _opt_str(bot.get("handle")) or ""
+    ).lower() == "human"
 
 
 def _bot_label(bot: Any, raw_author: str, default_bot: ChatInfo | None) -> str | None:
