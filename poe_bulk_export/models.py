@@ -42,6 +42,7 @@ class Chat:
     node_id: str
     title: str
     bot: str
+    bot_handle: str = ""
     messages: list[Message] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,5 +52,6 @@ class Chat:
             "id": self.node_id,
             "title": self.title,
             "bot": self.bot,
+            "botHandle": self.bot_handle,
             "messages": [m.to_dict() for m in self.messages],
         }
