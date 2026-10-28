@@ -22,8 +22,18 @@ class PoeClient:
         lat: str | None = None,
         headless: bool = True,
     ) -> None:
-        self.browser = playwright.chromium.launch(headless=headless)
-        self.context = self.browser.new_context()
+        self.browser = playwright.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self.context = self.browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+        )
         cookies: list[dict[str, Any]] = [
             {
                 "name": "p-b",
@@ -55,14 +65,30 @@ class PoeClient:
 
         self.page.on("request", on_request)
         print("Loading poe.com…", file=sys.stderr)
-        self.page.goto("https://poe.com", wait_until="networkidle", timeout=60_000)
+        # Poe keeps background traffic open, so networkidle often never settles.
+        self.page.goto(
+            "https://poe.com",
+            wait_until="domcontentloaded",
+            timeout=90_000,
+        )
+        try:
+            self.page.wait_for_load_state("load", timeout=30_000)
+        except Exception:
+            pass
+
+        # Wait briefly for the SPA to issue a gql_POST so we can copy poe-* headers.
+        for _ in range(20):
+            if self._headers:
+                break
+            self.page.wait_for_timeout(500)
 
         if self._headers:
             formkey = self._headers.get("poe-formkey", "n/a")
             print(f"Connected (formkey: {formkey[:8]}…)", file=sys.stderr)
         else:
             print(
-                "Warning: could not capture poe-* headers; GraphQL may fail.",
+                "Warning: could not capture poe-* headers; GraphQL may fail. "
+                "Try: poe-bulk-export list --headed",
                 file=sys.stderr,
             )
 
