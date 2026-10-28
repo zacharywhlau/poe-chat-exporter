@@ -352,6 +352,80 @@ class PoeClient:
 
             return data
 
+    def _wait_for_navigation_settle(self, quiet_ms: int = 800, timeout_ms: int = 20_000) -> None:
+        """Wait until the page URL/load stops changing (Poe often redirects /c → bot URL)."""
+        deadline = time.time() + timeout_ms / 1000
+        last = self.page.url
+        stable_since = time.time()
+        while time.time() < deadline:
+            try:
+                self.page.wait_for_load_state("domcontentloaded", timeout=3_000)
+            except Exception:
+                pass
+            self.page.wait_for_timeout(200)
+            current = self.page.url
+            if current != last:
+                last = current
+                stable_since = time.time()
+                continue
+            if (time.time() - stable_since) * 1000 >= quiet_ms:
+                return
+
+    def _safe_evaluate(self, expression: str, arg: Any = None, retries: int = 5) -> Any:
+        """page.evaluate that retries when Poe navigates mid-call."""
+        last_exc: Exception | None = None
+        for _ in range(retries):
+            try:
+                if arg is None:
+                    return self.page.evaluate(expression)
+                return self.page.evaluate(expression, arg)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc).lower()
+                if "context was destroyed" in msg or "navigation" in msg:
+                    self._wait_for_navigation_settle()
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        return None
+
+    def _scroll_chat_up(self) -> None:
+        """Scroll toward older messages without relying on a fragile evaluate."""
+        try:
+            self.page.keyboard.press("Home")
+        except Exception:
+            pass
+        try:
+            self.page.mouse.wheel(0, -4000)
+        except Exception:
+            pass
+        try:
+            self._safe_evaluate(
+                """() => {
+                    const nodes = Array.from(document.querySelectorAll('*'));
+                    let best = document.scrollingElement;
+                    let bestOverflow = 0;
+                    for (const el of nodes) {
+                      const style = getComputedStyle(el);
+                      const oy = style.overflowY;
+                      if ((oy === 'auto' || oy === 'scroll') &&
+                          el.scrollHeight > el.clientHeight + 50) {
+                        const score = el.scrollHeight - el.clientHeight;
+                        if (score > bestOverflow) {
+                          bestOverflow = score;
+                          best = el;
+                        }
+                      }
+                    }
+                    if (best) best.scrollTop = 0;
+                    window.scrollTo(0, 0);
+                }"""
+            )
+        except Exception:
+            # Scroll is best-effort; message harvest still uses network events.
+            pass
+
     def harvest_chat_messages(
         self,
         chat: Chat,
@@ -382,56 +456,38 @@ class PoeClient:
 
         self.page.on("response", on_response)
         try:
-            loaded_url = None
+            opened = False
             for url in _chat_urls(chat):
                 print(f"Opening {url}", file=sys.stderr)
                 try:
-                    self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+                    self.page.goto(url, wait_until="commit", timeout=90_000)
                 except Exception as exc:
                     print(f"  navigation error: {exc}", file=sys.stderr)
                     continue
+                self._wait_for_navigation_settle()
                 try:
                     self.page.wait_for_load_state("load", timeout=20_000)
                 except Exception:
                     pass
-                self.page.wait_for_timeout(2500)
-                if by_id or gql_hits > 0:
-                    loaded_url = url
+                # Extra settle time for client-side redirect + first gql payloads
+                self.page.wait_for_timeout(3000)
+                self._wait_for_navigation_settle()
+                print(f"  landed on {self.page.url}", file=sys.stderr)
+                opened = True
+                if by_id:
                     break
-                # Still try next URL pattern if nothing useful arrived
+                # If we got gql traffic but no parseable messages, still try scrolling
+                if gql_hits > 0:
+                    break
 
-            if not loaded_url and _chat_urls(chat):
-                # Stay on last attempted URL and keep waiting/scrolling
-                loaded_url = self.page.url
-                print(
-                    f"No messages yet; continuing on {loaded_url}",
-                    file=sys.stderr,
-                )
+            if not opened:
+                print("Could not open any chat URL", file=sys.stderr)
+                return []
 
             for i in range(scroll_pages):
                 before = len(by_id)
-                self.page.evaluate(
-                    """() => {
-                        const nodes = Array.from(document.querySelectorAll('*'));
-                        let best = document.scrollingElement;
-                        let bestOverflow = 0;
-                        for (const el of nodes) {
-                          const style = getComputedStyle(el);
-                          const oy = style.overflowY;
-                          if ((oy === 'auto' || oy === 'scroll') &&
-                              el.scrollHeight > el.clientHeight + 50) {
-                            const score = el.scrollHeight - el.clientHeight;
-                            if (score > bestOverflow) {
-                              bestOverflow = score;
-                              best = el;
-                            }
-                          }
-                        }
-                        if (best) best.scrollTop = 0;
-                        window.scrollTo(0, 0);
-                    }"""
-                )
-                self.page.wait_for_timeout(1000)
+                self._scroll_chat_up()
+                self.page.wait_for_timeout(1200)
                 if len(by_id) == before:
                     self.page.wait_for_timeout(1500)
                     if len(by_id) == before and i > 2:
@@ -439,7 +495,7 @@ class PoeClient:
 
             print(
                 f"Harvested {len(by_id)} message(s) "
-                f"from {gql_hits} gql response(s)",
+                f"from {gql_hits} gql response(s) at {self.page.url}",
                 file=sys.stderr,
             )
         finally:
